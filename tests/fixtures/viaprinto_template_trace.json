@@ -1,0 +1,13 @@
+[
+  {
+    "url": "https://www.viaprinto.de/-/content_size?PAGES=4&CONTENT_SIZE=210x297&AMOUNT=200&CONTENT_PAPER=matte-white-135&COVER_PAPER=matte-white-135",
+    "method": "GET",
+    "resource_type": "xhr",
+    "status": 200,
+    "request_headers": {
+      "accept": "application/json"
+    },
+    "response_content_type": "application/json",
+    "response_body_preview": "{\"price\":{\"net\":12.34,\"gross\":14.68}}"
+  }
+]

@@ -1,0 +1,180 @@
+{
+  "site_name": "onlineprinters.de",
+  "option_groups": [
+    {
+      "group": "Seitigkeit",
+      "controlTypes": [
+        "checkbox"
+      ],
+      "optionCount": 2,
+      "sampleValues": [
+        "8-seitig",
+        "16-seitig"
+      ]
+    }
+  ],
+  "option_catalog": [
+    {
+      "groupLabel": "Seitigkeit",
+      "normalizedGroupLabel": "seitigkeit",
+      "visibleGroupLabel": "Seitigkeit",
+      "controlTags": [
+        "input"
+      ],
+      "controlTypes": [
+        "checkbox"
+      ],
+      "optionCount": 2,
+      "capturedOptionCount": 2,
+      "selectedOptionCount": 1,
+      "truncated": false,
+      "sourceHints": {},
+      "groupAttributes": {},
+      "backendHints": {},
+      "selectedOptions": [
+        {
+          "label": "8-seitig",
+          "value": "8-seitig",
+          "controlTag": "input",
+          "controlType": "checkbox"
+        }
+      ],
+      "options": [
+        {
+          "groupLabel": "Seitigkeit",
+          "normalizedGroupLabel": "seitigkeit",
+          "visibleLabel": "8-seitig",
+          "visibleValue": "8-seitig",
+          "selected": true,
+          "controlTag": "input",
+          "controlType": "checkbox",
+          "name": "input_var_PBRA444_2_1",
+          "id": "pages-8",
+          "href": "",
+          "variantUrl": "",
+          "backendHints": {
+            "dataVarindex": "PBRA444.135.081000",
+            "dataPrnumber": "PBRA444135081000",
+            "dataPimvarnodekey": "PBRA444_135_08",
+            "dataOptionId": "",
+            "dataPropertyId": "",
+            "href": "",
+            "variantUrl": "",
+            "dataAttributes": {}
+          },
+          "controlAttributes": {},
+          "groupAttributes": {},
+          "dataAttributes": {},
+          "ariaLabel": "",
+          "title": ""
+        },
+        {
+          "groupLabel": "Seitigkeit",
+          "normalizedGroupLabel": "seitigkeit",
+          "visibleLabel": "16-seitig",
+          "visibleValue": "16-seitig",
+          "selected": false,
+          "controlTag": "input",
+          "controlType": "checkbox",
+          "name": "input_var_PBRA444_2_1",
+          "id": "pages-16",
+          "href": "",
+          "variantUrl": "",
+          "backendHints": {
+            "dataVarindex": "PBRA444.135.161000",
+            "dataPrnumber": "PBRA444135161000",
+            "dataPimvarnodekey": "PBRA444_135_16",
+            "dataOptionId": "",
+            "dataPropertyId": "",
+            "href": "",
+            "variantUrl": "",
+            "dataAttributes": {}
+          },
+          "controlAttributes": {},
+          "groupAttributes": {},
+          "dataAttributes": {},
+          "ariaLabel": "",
+          "title": ""
+        }
+      ]
+    },
+    {
+      "groupLabel": "Auflage",
+      "normalizedGroupLabel": "auflage",
+      "visibleGroupLabel": "Auflage",
+      "controlTags": [
+        "input"
+      ],
+      "controlTypes": [
+        "number"
+      ],
+      "optionCount": 1,
+      "capturedOptionCount": 1,
+      "selectedOptionCount": 1,
+      "truncated": false,
+      "sourceHints": {},
+      "groupAttributes": {},
+      "backendHints": {},
+      "selectedOptions": [
+        {
+          "label": "1000",
+          "value": "1000",
+          "controlTag": "input",
+          "controlType": "number"
+        }
+      ],
+      "options": [
+        {
+          "groupLabel": "Auflage",
+          "normalizedGroupLabel": "auflage",
+          "visibleLabel": "1000",
+          "visibleValue": "1000",
+          "selected": true,
+          "controlTag": "input",
+          "controlType": "number",
+          "name": "input_var_PBRA444_3_1",
+          "id": "quantity",
+          "href": "",
+          "variantUrl": "",
+          "backendHints": {
+            "dataVarindex": "",
+            "dataPrnumber": "",
+            "dataPimvarnodekey": "",
+            "dataOptionId": "",
+            "dataPropertyId": "",
+            "href": "",
+            "variantUrl": "",
+            "dataAttributes": {}
+          },
+          "controlAttributes": {},
+          "groupAttributes": {},
+          "dataAttributes": {},
+          "ariaLabel": "",
+          "title": ""
+        }
+      ]
+    }
+  ],
+  "request_templates": {
+    "currentSetLink": {
+      "value": "https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4?depvar_index_setparent=%3CPBRA444%3E%3CPBRA444.135.081000%3E",
+      "source": "fixture"
+    },
+    "hiddenInputs": [],
+    "forms": []
+  },
+  "quantity_signal": {
+    "mode": "manual_only",
+    "hasManualInput": true,
+    "presetValues": [],
+    "maxPreset": null,
+    "hasThresholdBehavior": false
+  },
+  "option_dependencies": [],
+  "dependency_probe": {
+    "activeProbeDependencies": []
+  },
+  "cookies": {
+    "session": "fixture"
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "stages": [
+    {
+      "name": "single_config",
+      "unit_budget": 2,
+      "repeat_same_unit": true,
+      "requires_proxy": false,
+      "envelope": {
+        "workers": 1,
+        "max_inflight": 1,
+        "max_rps": 0.5,
+        "jitter_ms": 200,
+        "http_max_retries": 1,
+        "http_backoff_base_ms": 600,
+        "http_backoff_max_ms": 4000
+      },
+      "gate": {
+        "min_units": 1,
+        "min_success_rate": 0.0,
+        "max_block_rate": 1.0,
+        "max_server_error_rate": 1.0
+      }
+    },
+    {
+      "name": "probe",
+      "unit_budget": 5,
+      "repeat_same_unit": false,
+      "requires_proxy": false,
+      "envelope": {
+        "workers": 1,
+        "max_inflight": 1,
+        "max_rps": 0.75,
+        "jitter_ms": 200,
+        "http_max_retries": 1,
+        "http_backoff_base_ms": 700,
+        "http_backoff_max_ms": 5000
+      },
+      "gate": {
+        "min_units": 1,
+        "min_success_rate": 0.0,
+        "max_block_rate": 1.0,
+        "max_server_error_rate": 1.0
+      }
+    },
+    {
+      "name": "pilot",
+      "unit_budget": 8,
+      "repeat_same_unit": false,
+      "requires_proxy": false,
+      "envelope": {
+        "workers": 1,
+        "max_inflight": 1,
+        "max_rps": 1.0,
+        "jitter_ms": 250,
+        "http_max_retries": 1,
+        "http_backoff_base_ms": 800,
+        "http_backoff_max_ms": 6000
+      },
+      "gate": {
+        "min_units": 1,
+        "min_success_rate": 0.0,
+        "max_block_rate": 1.0,
+        "max_server_error_rate": 1.0
+      }
+    }
+  ]
+}

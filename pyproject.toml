@@ -1,0 +1,38 @@
+[project]
+name = "price-extraction-agentic"
+version = "0.1.0"
+description = "MVP agentic framework for feasibility-first price extraction"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Sathvik" }
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+browser = [
+  "playwright>=1.52.0"
+]
+
+agentic = [
+  "langgraph>=0.2.0",
+  "langchain-core>=0.3.0"
+]
+
+[project.scripts]
+price-agent = "price_extractor.cli:main"
+price-onboard = "price_extractor.agentic.onboarding:main"
+price-onboard-lg = "price_extractor.agentic.langgraph_onboarding:main"
+price-onboard-gemini = "price_extractor.agentic.gemini_onboarding:main"
+price-results-export = "price_extractor.results_export:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

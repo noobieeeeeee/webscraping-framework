@@ -1,0 +1,7 @@
+
+[agentic]
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+[browser]
+playwright>=1.52.0

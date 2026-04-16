@@ -1,0 +1,24 @@
+{
+  "targets": [
+    {
+      "url": "https://www.onlineprinters.de/p/flyers-din-a6-querformat",
+      "site_name": "onlineprinters",
+      "product_type": "flyer",
+      "expected_currency": "EUR",
+      "options": {
+        "format": "DIN A6",
+        "material": "135g glossy"
+      }
+    },
+    {
+      "url": "https://print24.com/de/produkt/flyer",
+      "site_name": "print24",
+      "product_type": "flyer",
+      "expected_currency": "EUR",
+      "options": {
+        "format": "A5",
+        "paper": "170g"
+      }
+    }
+  ]
+}

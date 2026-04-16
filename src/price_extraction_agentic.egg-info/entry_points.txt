@@ -1,0 +1,5 @@
+[console_scripts]
+price-agent = price_extractor.cli:main
+price-onboard = price_extractor.agentic.onboarding:main
+price-onboard-lg = price_extractor.agentic.langgraph_onboarding:main
+price-results-export = price_extractor.results_export:main

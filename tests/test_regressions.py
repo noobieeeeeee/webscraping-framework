@@ -1,0 +1,1114 @@
+from __future__ import annotations
+
+import json
+import io
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+from urllib import error
+
+ROOT = Path(__file__).resolve().parents[1]
+import sys
+
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+
+from price_extractor import cli
+from price_extractor.agents import ExecutionAgent, ValidationAgent
+from price_extractor.browser_bootstrap import BootstrapResult
+from price_extractor.knowledge_store import KnowledgeStore
+from price_extractor.models import ExtractionResult, ObservationBundle, RunState, Strategy, StrategyPlan, TargetInput
+from price_extractor.site_adapters import build_site_replay_candidates
+from price_extractor.orchestrator import ExtractionOrchestrator
+from price_extractor.models import Complexity, FeasibilityResult, ValidationResult
+
+
+FIXTURES = ROOT / "tests" / "fixtures"
+
+
+def load_fixture(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def make_args(**overrides: object) -> SimpleNamespace:
+    defaults: dict[str, object] = {
+        "url": "https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4",
+        "manifest_file": None,
+        "manifest_csv": None,
+        "site_name": None,
+        "product_type": "unknown",
+        "option": [],
+        "options_json": None,
+        "options_file": None,
+        "expected_price": None,
+        "expected_price_tolerance": 0.01,
+        "expected_currency": "EUR",
+        "headed": False,
+        "headed_debug_hold_seconds": 0.0,
+        "disable_auto_accept_cookies": False,
+        "verbose": False,
+        "allow_heuristic_fallback": False,
+        "require_matched_options": False,
+        "request_only": False,
+        "recon_only": False,
+        "recon_ttl_days": 7,
+        "force_recon_refresh": False,
+        "bootstrap_timeout_ms": 1000,
+        "max_observed_requests": 32,
+        "http_request_timeout_seconds": 15.0,
+        "http_min_delay_ms": 0,
+        "http_jitter_ms": 0,
+        "http_max_retries": 1,
+        "http_backoff_base_ms": 400,
+        "http_backoff_max_ms": 5000,
+        "proxy_url": None,
+        "proxy_file": None,
+        "proxy_rotation": "none",
+        "proxy_failure_threshold": 3,
+        "proxy_cooldown_seconds": 300,
+        "max_dependency_probe_steps": 0,
+        "knowledge_db": str(ROOT / ".data" / "test-knowledge.db"),
+        "max_attempts": 1,
+        "checkpoint_file": str(ROOT / ".data" / "checkpoints" / "test-job-state.json"),
+        "retry_failed": False,
+        "output_file": None,
+        "results_jsonl": None,
+        "results_jsonl_mode": "compact",
+        "artifacts_dir": None,
+        "fail_on_invalid": False,
+    }
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+class FakeHttpResponse:
+    def __init__(self, payload: str, content_type: str = "application/json", status: int = 200) -> None:
+        self._payload = payload.encode("utf-8")
+        self.headers = {"content-type": content_type}
+        self.status = status
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def __enter__(self) -> "FakeHttpResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class RegressionTests(unittest.TestCase):
+    def test_best_price_candidate_ignores_zero_values(self) -> None:
+        candidates = [
+            {"value": 0.0, "score": 999, "source": "named:total_gross_value"},
+            {"value": 12.34, "score": 5, "source": "json:data.response.price"},
+        ]
+
+        best = ExecutionAgent._select_best_price_candidate(candidates, expected_price=None)
+        self.assertIsNotNone(best)
+        self.assertEqual(best.get("value"), 12.34)
+
+    def test_saxoprint_adapter_overrides_quantity_and_print_runs(self) -> None:
+        traces = load_fixture("saxoprint_template_traces.json")
+
+        state = RunState(
+            target=TargetInput(
+                site_name="saxoprint.de",
+                product_url="https://www.saxoprint.de/broschueren/broschueren-drucken",
+                product_type="brochure",
+                options={"quantity": 600},
+                network_traces=traces,
+                bootstrap_signals={},
+            )
+        )
+
+        candidates = build_site_replay_candidates(
+            state,
+            effective_options={"quantity": 600},
+            raw_requested_options={"quantity": 600},
+        )
+        self.assertTrue(candidates)
+        sax = candidates[0]
+        self.assertIn("saxoprint", str(sax.get("source")))
+
+        body = json.loads(str(sax.get("body_text")))
+        self.assertEqual(body.get("productGroupId"), 305)
+        prop = {int(row["propertyId"]): int(row["value"]) for row in body.get("propertyConfiguration")}
+        self.assertEqual(prop.get(44), 600)
+        self.assertEqual(body.get("printRuns"), [600, 750, 800, 900])
+
+    def test_saxoprint_adapter_disambiguates_brochure_cover_vs_content_options(self) -> None:
+        traces = load_fixture("saxoprint_template_traces.json")
+
+        dropdown_maps = [
+            {
+                "source": "fixture",
+                "propertyId": 8,
+                "triggerText": "Material",
+                "contextHint": "content",
+                "options": [
+                    "250 g/m² Naturpapier FSC®",
+                    "170 g/m² Bilderdruckpapier matt",
+                ],
+                "valueIds": [1616, 269],
+            },
+            {
+                "source": "fixture",
+                "propertyId": 36,
+                "triggerText": "Material",
+                "contextHint": "cover",
+                "options": [
+                    "130 g/m² Bilderdruckpapier",
+                    "170 g/m² Bilderdruckpapier matt",
+                ],
+                "valueIds": [480, 481],
+            },
+            {
+                "source": "fixture",
+                "propertyId": 38,
+                "triggerText": "Seitenanzahl",
+                "contextHint": "cover",
+                "options": ["4 Seiten"],
+                "valueIds": [265],
+            },
+        ]
+
+        state = RunState(
+            target=TargetInput(
+                site_name="saxoprint.de",
+                product_url="https://www.saxoprint.de/broschueren/broschueren-drucken",
+                product_type="brochure",
+                options={"quantity": 600},
+                network_traces=traces,
+                bootstrap_signals={"request_templates": {"dropdownMaps": dropdown_maps}},
+            )
+        )
+
+        candidates = build_site_replay_candidates(
+            state,
+            effective_options={"quantity": 600},
+            raw_requested_options={
+                "quantity": 600,
+                "material": "170gsm",
+                "umschlag_material": "130gsm",
+                "umschlag_seitenanzahl": 4,
+            },
+        )
+        self.assertTrue(candidates)
+        body = json.loads(str(candidates[0].get("body_text")))
+        prop = {int(row["propertyId"]): int(row["value"]) for row in body.get("propertyConfiguration")}
+        self.assertEqual(prop.get(8), 269)
+        self.assertEqual(prop.get(36), 480)
+        self.assertEqual(prop.get(38), 265)
+
+        applied = dict(candidates[0].get("request_template_applied") or {})
+        self.assertEqual(applied.get("kind"), "saxoprint_payload")
+        self.assertEqual(list(applied.get("synthesisIssues") or []), [])
+
+    def test_saxoprint_adapter_reports_ambiguous_shorthand_in_synthesis_issues(self) -> None:
+        traces = load_fixture("saxoprint_template_traces.json")
+
+        dropdown_maps = [
+            {
+                "source": "fixture",
+                "propertyId": 8,
+                "triggerText": "Material",
+                "contextHint": "content",
+                "options": [
+                    "170 g/m² Bilderdruckpapier matt",
+                    "170 g/m² Bilderdruckpapier glänzend",
+                ],
+                "valueIds": [269, 270],
+            }
+        ]
+
+        state = RunState(
+            target=TargetInput(
+                site_name="saxoprint.de",
+                product_url="https://www.saxoprint.de/broschueren/broschueren-drucken",
+                product_type="brochure",
+                options={"quantity": 600},
+                network_traces=traces,
+                bootstrap_signals={"request_templates": {"dropdownMaps": dropdown_maps}},
+            )
+        )
+
+        candidates = build_site_replay_candidates(
+            state,
+            effective_options={"quantity": 600},
+            raw_requested_options={
+                "quantity": 600,
+                "material": "170gsm",
+            },
+        )
+        self.assertTrue(candidates)
+        applied = dict(candidates[0].get("request_template_applied") or {})
+        issues = list(applied.get("synthesisIssues") or [])
+        self.assertTrue(issues)
+        self.assertEqual(str(issues[0].get("key")), "material")
+        self.assertIn(str(issues[0].get("reason")), {"ambiguous_contains", "ambiguous_exact", "ambiguous_numeric"})
+
+        body = json.loads(str(candidates[0].get("body_text")))
+        prop = {int(row["propertyId"]): int(row["value"]) for row in body.get("propertyConfiguration")}
+        self.assertIsNone(prop.get(8))
+
+    def test_request_only_fails_when_saxoprint_synthesis_issues_present(self) -> None:
+        target = TargetInput(
+            site_name="saxoprint.de",
+            product_url="https://www.saxoprint.de/broschueren/broschueren-drucken",
+            product_type="brochure",
+            expected_currency="EUR",
+            options={"quantity": 600, "material": "170gsm"},
+            bootstrap_signals={"request_only": True, "learned_normalization_rules": {}},
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint="https://api.saxoprint.de/product-configuration/get-product-prices",
+            payload_template={},
+            confidence=0.8,
+            notes="",
+        )
+        state.extraction = ExtractionResult(
+            success=True,
+            accepted_configuration=dict(target.options),
+            price_value=12.34,
+            currency="EUR",
+            raw_response_summary={
+                "replay": "http",
+                "fallback": "none",
+                "requestTemplateApplied": {
+                    "kind": "saxoprint_payload",
+                    "synthesisIssues": [{"key": "material", "reason": "ambiguous_contains"}],
+                },
+            },
+        )
+
+        result = ValidationAgent().run(state)
+        self.assertFalse(result.is_valid)
+        self.assertTrue(
+            any(str(row).startswith("request_only_option_synthesis_failed") for row in result.mismatches)
+        )
+        self.assertEqual(result.inferred_failure_reason, "request_only_option_synthesis_failed")
+
+    def test_saxoprint_adapter_honors_explicit_property_overrides(self) -> None:
+        traces = load_fixture("saxoprint_template_traces.json")
+
+        state = RunState(
+            target=TargetInput(
+                site_name="saxoprint.de",
+                product_url="https://www.saxoprint.de/broschueren/broschueren-drucken",
+                product_type="brochure",
+                options={"quantity": 600},
+                network_traces=traces,
+                bootstrap_signals={},
+            )
+        )
+
+        candidates = build_site_replay_candidates(
+            state,
+            effective_options={"quantity": 600},
+            raw_requested_options={"quantity": 600, "property_9": 51},
+        )
+        self.assertTrue(candidates)
+        body = json.loads(str(candidates[0].get("body_text")))
+        prop = {int(row["propertyId"]): int(row["value"]) for row in body.get("propertyConfiguration")}
+        self.assertEqual(prop.get(9), 51)
+
+    def test_saxoprint_label_matching_accepts_fscr_shorthand(self) -> None:
+        from price_extractor.site_adapters import SaxoprintSiteAdapter
+
+        value_ids = [1616, 269]
+        labels = [
+            "250 g/m² Naturpapier FSC®",
+            "170 g/m² Bilderdruckpapier matt",
+        ]
+        mapping = SaxoprintSiteAdapter._build_label_to_value_id(value_ids, labels)
+        resolved = SaxoprintSiteAdapter._lookup_value_id(mapping, "250 g/m² Naturpapier FSCr")
+        self.assertEqual(resolved, 1616)
+
+    def test_build_results_jsonl_row_compact(self) -> None:
+        row = cli._build_results_jsonl_row(
+            unit_id="unit_123",
+            index=4,
+            spec={"url": "https://example.test/p/1"},
+            summary={
+                "site": "example.test",
+                "validated": True,
+                "price": 12.34,
+                "currency": "EUR",
+                "replay_mode": "http",
+                "fallback_mode": "none",
+                "extraction_reason": None,
+                "mismatches": [],
+                "artifact_dir": ".data/runs/example/unit_123",
+            },
+            status="completed",
+            mode="compact",
+        )
+        self.assertEqual(row["unit_id"], "unit_123")
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["replay_mode"], "http")
+        self.assertNotIn("summary", row)
+
+    def test_build_results_jsonl_row_full(self) -> None:
+        summary = {"site": "example.test", "validated": False, "price": None}
+        row = cli._build_results_jsonl_row(
+            unit_id="unit_123",
+            index=4,
+            spec={"url": "https://example.test/p/1"},
+            summary=summary,
+            status="failed",
+            mode="full",
+        )
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("summary", row)
+        self.assertEqual(row["summary"], summary)
+
+    def test_parse_manifest_csv_supports_option_columns_and_options_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = Path(tmp_dir) / "targets.csv"
+            csv_path.write_text(
+                "url,site_name,product_type,options_json,option.quantity,option.format\n"
+                'https://example.test/p/1,example.test,brochure,"{""material"": ""130gsm"", ""sided"": 2}",250,A5\n',
+                encoding="utf-8",
+            )
+
+            rows = cli.parse_manifest_csv(str(csv_path))
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["url"], "https://example.test/p/1")
+        self.assertEqual(row["site_name"], "example.test")
+        self.assertEqual(row["product_type"], "brochure")
+        self.assertEqual(row["options"].get("quantity"), 250)
+        self.assertEqual(row["options"].get("format"), "A5")
+        self.assertEqual(row["options"].get("material"), "130gsm")
+        self.assertEqual(row["options"].get("sided"), 2)
+
+    def test_parse_manifest_csv_semicolon_row_config_with_default_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = Path(tmp_dir) / "matrix.csv"
+            csv_path.write_text(
+                "UID;Innenteil;Papier;Zusätzlicher_Umschlag;Type;Format;Auflage;Net price;Ausrichtung\n"
+                "1;4-seitig;90 g/m² Bilderdruckpapier;Umschlag 130 g/m² Bilderdruck;broschueren-klammerheftung;DIN A3;250;;Hochformat\n",
+                encoding="utf-8",
+            )
+
+            rows = cli.parse_manifest_csv(
+                str(csv_path),
+                default_url="https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4",
+                default_site_name="onlineprinters",
+            )
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["url"], "https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4")
+        self.assertEqual(row["site_name"], "onlineprinters")
+        self.assertEqual(row["product_type"], "broschueren-klammerheftung")
+        self.assertEqual(row["options"].get("Innenteil"), "4-seitig")
+        self.assertEqual(row["options"].get("Papier"), "90 g/m² Bilderdruckpapier")
+        self.assertEqual(row["options"].get("Auflage"), 250)
+
+    def test_load_proxy_pool_from_file_and_direct_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            proxy_file = Path(tmp_dir) / "proxies.txt"
+            proxy_file.write_text(
+                "# comment\n"
+                "http://user:pass@proxy-1.example:8080\n"
+                "\n"
+                "http://user:pass@proxy-1.example:8080\n"
+                "http://proxy-2.example:8080\n",
+                encoding="utf-8",
+            )
+
+            pool = cli.load_proxy_pool(str(proxy_file), "http://proxy-3.example:8080")
+
+        self.assertEqual(
+            pool,
+            [
+                "http://user:pass@proxy-1.example:8080",
+                "http://proxy-2.example:8080",
+                "http://proxy-3.example:8080",
+            ],
+        )
+
+    def test_build_target_input_reuses_cached_recon_for_pricing_runs(self) -> None:
+        bootstrap_artifacts = load_fixture("onlineprinters_enriched_bootstrap.json")
+        bootstrap_artifacts["network_traces"] = load_fixture("onlineprinters_template_trace.json")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = KnowledgeStore(str(Path(tmp_dir) / "knowledge.db"))
+            try:
+                store.save_recon_snapshot(
+                    site_name="onlineprinters.de",
+                    product_url="https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4",
+                    bootstrap_artifacts=bootstrap_artifacts,
+                    ttl_days=7,
+                )
+                args = make_args(option=["quantity=250", "seitig=16"])
+
+                with mock.patch("price_extractor.cli.bootstrap_product_url") as bootstrap_mock:
+                    target, artifacts = cli.build_target_input(
+                        {"url": args.url, "site_name": None, "product_type": "unknown", "expected_currency": "EUR", "options": {}},
+                        args,
+                        store,
+                    )
+
+                self.assertTrue(artifacts["recon_cache"]["hit"])
+                self.assertTrue(target.bootstrap_signals["option_prevalidation"]["available"])
+                bootstrap_mock.assert_not_called()
+            finally:
+                store.close()
+
+    def test_build_target_input_force_refresh_bypasses_cache(self) -> None:
+        bootstrap_artifacts = load_fixture("onlineprinters_enriched_bootstrap.json")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = KnowledgeStore(str(Path(tmp_dir) / "knowledge.db"))
+            try:
+                store.save_recon_snapshot(
+                    site_name="onlineprinters.de",
+                    product_url="https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4",
+                    bootstrap_artifacts=bootstrap_artifacts,
+                    ttl_days=7,
+                )
+                args = make_args(option=["quantity=250"])
+                fake_bootstrap = BootstrapResult(
+                    site_name="onlineprinters.de",
+                    observed_requests=["https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4"],
+                    network_traces=load_fixture("onlineprinters_template_trace.json"),
+                    option_catalog=bootstrap_artifacts["option_catalog"],
+                    request_templates=bootstrap_artifacts["request_templates"],
+                    quantity_signal=bootstrap_artifacts["quantity_signal"],
+                )
+
+                with mock.patch("price_extractor.cli.bootstrap_product_url", return_value=fake_bootstrap) as bootstrap_mock:
+                    _target, artifacts = cli.build_target_input(
+                        {"url": args.url, "site_name": None, "product_type": "unknown", "expected_currency": "EUR", "options": {}},
+                        args,
+                        store,
+                        force_recon_refresh=True,
+                    )
+
+                self.assertTrue(artifacts["recon_cache"]["refreshed"])
+                bootstrap_mock.assert_called_once()
+            finally:
+                store.close()
+
+    def test_run_single_target_refreshes_cached_recon_once_on_drift(self) -> None:
+        args = make_args()
+        spec = {"url": args.url}
+        target_cached = TargetInput(
+            site_name="onlineprinters.de",
+            product_url=args.url,
+            product_type="unknown",
+            bootstrap_signals={
+                "recon_cache": {"hit": True},
+                "option_prevalidation": {"available": True, "valid": True, "matched": [], "unmatched": []},
+                "drift_report": {},
+            },
+        )
+        target_refreshed = TargetInput(
+            site_name="onlineprinters.de",
+            product_url=args.url,
+            product_type="unknown",
+            bootstrap_signals={
+                "recon_cache": {"hit": False, "refreshed": True},
+                "option_prevalidation": {"available": True, "valid": True, "matched": [], "unmatched": []},
+                "drift_report": {},
+            },
+        )
+        bootstrap_cached = {
+            "recon_cache": {"hit": True},
+            "option_catalog": [{"groupLabel": "Seitigkeit", "options": [{"visibleLabel": "8-seitig"}]}],
+            "request_templates": {"currentSetLink": {"value": "https://example.com"}},
+            "quantity_signal": {},
+            "option_groups": [],
+            "option_dependencies": [],
+            "dependency_probe": {},
+        }
+        bootstrap_refreshed = {
+            "recon_cache": {"hit": False, "refreshed": True},
+            "option_catalog": [{"groupLabel": "Seitigkeit", "options": [{"visibleLabel": "16-seitig"}]}],
+            "request_templates": {"currentSetLink": {"value": "https://example.com/new"}},
+            "quantity_signal": {},
+            "option_groups": [],
+            "option_dependencies": [],
+            "dependency_probe": {},
+        }
+
+        fake_orchestrator = SimpleNamespace(store=object(), run=lambda state: state)
+        failing_summary = {
+            "site": "onlineprinters.de",
+            "url": args.url,
+            "validated": False,
+            "feasible": True,
+            "strategy": "hybrid",
+            "price": None,
+            "currency": "EUR",
+            "mismatches": ["price_not_extracted"],
+            "failures": [],
+            "http_replay": {"attempts": [{"reason": "no_matching_trace"}]},
+            "replay_mode": "http",
+            "fallback_mode": "none",
+            "extraction_reason": "price_not_extracted",
+        }
+        success_summary = {
+            "site": "onlineprinters.de",
+            "url": args.url,
+            "validated": True,
+            "feasible": True,
+            "strategy": "hybrid",
+            "price": 123.45,
+            "currency": "EUR",
+            "mismatches": [],
+            "failures": [],
+            "http_replay": {"attempts": [{"result": "success"}]},
+            "replay_mode": "http",
+            "fallback_mode": "none",
+            "extraction_reason": None,
+        }
+
+        with mock.patch("price_extractor.cli.build_target_input", side_effect=[(target_cached, bootstrap_cached), (target_refreshed, bootstrap_refreshed)]) as build_mock:
+            with mock.patch("price_extractor.cli.summarize_run", side_effect=[failing_summary, success_summary]):
+                summary, _final_state, _bootstrap = cli.run_single_target(fake_orchestrator, args, spec)
+
+        self.assertEqual(build_mock.call_count, 2)
+        self.assertEqual(summary["recon_refresh_reason"], "no_matching_trace")
+        self.assertTrue(summary["drift_report"]["compared"])
+        self.assertEqual(summary["drift_verdict"], "material_change")
+
+    def test_print24_replay_injects_portal_header(self) -> None:
+        trace = {
+            "url": "https://print24.com/api/de/itemmaster/calculation/productDetails/",
+            "method": "POST",
+            "resource_type": "xhr",
+            "status": 200,
+            "request_headers": {
+                "accept": "application/json",
+                "content-type": "application/json",
+            },
+            "response_content_type": "application/json",
+            "post_data": "{}",
+        }
+        target = TargetInput(
+            site_name="print24.com",
+            product_url="https://print24.com/de/druckprodukte/broschueren/broschueren-klammerheftung-greenline",
+            product_type="brochure",
+            network_traces=[trace],
+            bootstrap_signals={
+                "cookies": {"portalName": "print24"},
+                "request_only": True,
+                "learned_normalization_rules": {},
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(strategy=Strategy.HYBRID, endpoint=trace["url"], payload_template={}, confidence=0.8, notes="")
+        agent = ExecutionAgent()
+        seen_headers: dict[str, str] = {}
+
+        def fake_urlopen(req, timeout=15):
+            nonlocal seen_headers
+            seen_headers = {key.lower(): value for key, value in req.header_items()}
+            return FakeHttpResponse(
+                json.dumps({"prices": {"final_prices": {"total_gross_value": 70.47, "total_net_value": 59.22}}}),
+                content_type="application/json",
+            )
+
+        with mock.patch("price_extractor.agents.request.urlopen", side_effect=fake_urlopen):
+            result, replay_summary = agent._try_http_replay(state)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(seen_headers.get("portal"), "print24")
+        self.assertEqual(replay_summary["selectedVia"], "plan_endpoint")
+
+    def test_http_replay_retries_on_429_then_succeeds(self) -> None:
+        trace = {
+            "url": "https://api.example.test/pricing",
+            "method": "POST",
+            "resource_type": "xhr",
+            "status": 200,
+            "request_headers": {"content-type": "application/json"},
+            "response_content_type": "application/json",
+            "post_data": "{}",
+        }
+        target = TargetInput(
+            site_name="example.test",
+            product_url="https://example.test/product",
+            product_type="brochure",
+            network_traces=[trace],
+            bootstrap_signals={
+                "cookies": {},
+                "request_only": True,
+                "learned_normalization_rules": {},
+                "http_runtime": {
+                    "timeout_seconds": 10.0,
+                    "min_delay_ms": 0,
+                    "jitter_ms": 0,
+                    "max_retries": 1,
+                    "backoff_base_ms": 0,
+                    "backoff_max_ms": 0,
+                    "proxy_rotation": "none",
+                    "proxy_pool": [],
+                },
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(strategy=Strategy.HYBRID, endpoint=trace["url"], payload_template={}, confidence=0.8, notes="")
+        agent = ExecutionAgent()
+
+        http_429 = error.HTTPError(
+            trace["url"],
+            429,
+            "Too Many Requests",
+            {"content-type": "application/json"},
+            io.BytesIO(b'{"error":"rate_limited"}'),
+        )
+
+        with mock.patch(
+            "price_extractor.agents.request.urlopen",
+            side_effect=[http_429, FakeHttpResponse(json.dumps({"total_gross_value": 12.34}))],
+        ) as urlopen_mock:
+            result, replay_summary = agent._try_http_replay(state)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(urlopen_mock.call_count, 2)
+        self.assertTrue(any(row.get("result") == "retry" for row in replay_summary.get("attempts", [])))
+
+    def test_http_replay_applies_per_host_pacing(self) -> None:
+        primary_url = "https://api.example.test/pricing"
+        secondary_url = "https://api.example.test/pricing-alt"
+        traces = [
+            {
+                "url": primary_url,
+                "method": "POST",
+                "resource_type": "xhr",
+                "status": 200,
+                "request_headers": {"content-type": "application/json"},
+                "response_content_type": "application/json",
+                "post_data": "{}",
+            },
+            {
+                "url": secondary_url,
+                "method": "POST",
+                "resource_type": "xhr",
+                "status": 200,
+                "request_headers": {"content-type": "application/json"},
+                "response_content_type": "application/json",
+                "post_data": "{}",
+            },
+        ]
+        target = TargetInput(
+            site_name="example.test",
+            product_url="https://example.test/product",
+            product_type="brochure",
+            network_traces=traces,
+            bootstrap_signals={
+                "cookies": {},
+                "request_only": True,
+                "learned_normalization_rules": {},
+                "http_runtime": {
+                    "timeout_seconds": 10.0,
+                    "min_delay_ms": 250,
+                    "jitter_ms": 0,
+                    "max_retries": 0,
+                    "backoff_base_ms": 0,
+                    "backoff_max_ms": 0,
+                    "proxy_rotation": "none",
+                    "proxy_pool": [],
+                },
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(strategy=Strategy.HYBRID, endpoint=primary_url, payload_template={}, confidence=0.8, notes="")
+        state.observation = ObservationBundle(has_script_heavy_ui=True, has_api_calls=True, requires_session=True, endpoint_rankings=[{"url": secondary_url, "score": 12}])
+        agent = ExecutionAgent()
+
+        with mock.patch("price_extractor.agents.time.monotonic", side_effect=[100.0, 100.0, 100.0, 100.0]):
+            with mock.patch("price_extractor.agents.time.sleep") as sleep_mock:
+                with mock.patch(
+                    "price_extractor.agents.request.urlopen",
+                    side_effect=[error.URLError("boom"), FakeHttpResponse(json.dumps({"total_gross_value": 18.9}))],
+                ):
+                    result, _summary = agent._try_http_replay(state)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(any(call.args and float(call.args[0]) >= 0.25 for call in sleep_mock.mock_calls))
+
+    def test_proxy_is_quarantined_after_consecutive_failures(self) -> None:
+        agent = ExecutionAgent()
+        runtime = {
+            "proxy_pool": ["http://proxy-1.example:8080"],
+            "proxy_rotation": "round_robin",
+            "proxy_failure_threshold": 2,
+            "proxy_cooldown_seconds": 60,
+        }
+
+        with mock.patch("price_extractor.agents.time.monotonic", return_value=100.0):
+            proxy_a, _idx_a = agent._choose_proxy(runtime)
+            self.assertEqual(proxy_a, "http://proxy-1.example:8080")
+
+            agent._record_proxy_attempt_result(proxy_a, runtime, success=False)
+            proxy_b, _idx_b = agent._choose_proxy(runtime)
+            self.assertEqual(proxy_b, "http://proxy-1.example:8080")
+
+            agent._record_proxy_attempt_result(proxy_b, runtime, success=False)
+            proxy_c, idx_c = agent._choose_proxy(runtime)
+
+        self.assertIsNone(proxy_c)
+        self.assertIsNone(idx_c)
+
+    def test_print24_template_synthesis_rewrites_property_ids(self) -> None:
+        trace = load_fixture("print24_productdetails_trace.json")
+
+        target = TargetInput(
+            site_name="print24.com",
+            product_url="https://print24.com/de/druckprodukte/broschueren/broschueren-klammerheftung-greenline",
+            product_type="brochure",
+            options={"format": "A5", "quantity": 250},
+            network_traces=[trace],
+            bootstrap_signals={
+                "cookies": {"portalName": "print24"},
+                "request_only": True,
+                "learned_normalization_rules": {},
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(strategy=Strategy.HYBRID, endpoint=trace["url"], payload_template={}, confidence=0.8, notes="")
+
+        candidates = build_site_replay_candidates(
+            state,
+            effective_options=dict(target.options),
+            raw_requested_options=dict(target.options),
+        )
+        candidate = next((row for row in candidates if row.get("source") == "print24_synthesized_template"), None)
+        self.assertIsNotNone(candidate)
+        body = json.loads(candidate["body_text"])
+        props = {row["name"]: str(row["id"]) for row in body["properties"]}
+        self.assertEqual(props.get("format"), "268")
+        self.assertEqual(props.get("quantity"), "438")
+        applied = dict(candidate.get("request_template_applied") or {})
+        self.assertEqual(applied.get("kind"), "print24_property_ids")
+
+    def test_wir_machen_druck_template_synthesis_adds_price_scale_id(self) -> None:
+        traces = load_fixture("wir_machen_druck_template_traces.json")
+        target = TargetInput(
+            site_name="wir-machen-druck.de",
+            product_url="https://www.wir-machen-druck.de/broschuere-mit-drahtheftung-endformat-din-a4-8seitig.html",
+            product_type="brochure",
+            options={"quantity": 250, "format": "A5", "material": "130gsm"},
+            network_traces=traces,
+            bootstrap_signals={
+                "request_only": True,
+                "learned_normalization_rules": {},
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint="https://www.wir-machen-druck.de/wmdrest/article/get-price",
+            payload_template={},
+            confidence=0.8,
+            notes="",
+        )
+
+        candidates = build_site_replay_candidates(
+            state,
+            effective_options=dict(target.options),
+            raw_requested_options=dict(target.options),
+        )
+        scaled = next((row for row in candidates if row.get("source") == "wir_machen_druck_price_scale"), None)
+        manual = next((row for row in candidates if row.get("source") == "wir_machen_druck_quantity_manual"), None)
+        self.assertIsNotNone(scaled)
+        self.assertIsNotNone(manual)
+
+        scaled_body = json.loads(str(scaled.get("body_text") or "{}"))
+        self.assertEqual(scaled_body.get("quantity"), "250")
+        self.assertEqual(str(scaled_body.get("priceScaleId")), "65315686")
+        self.assertFalse(bool(scaled_body.get("isIndividualQuantity")))
+
+    def test_wir_machen_druck_http_replay_accepts_requested_quantity(self) -> None:
+        traces = load_fixture("wir_machen_druck_template_traces.json")
+        target = TargetInput(
+            site_name="wir-machen-druck.de",
+            product_url="https://www.wir-machen-druck.de/broschuere-mit-drahtheftung-endformat-din-a4-8seitig.html",
+            product_type="brochure",
+            expected_currency="EUR",
+            options={"quantity": 250, "format": "A5", "material": "130gsm"},
+            network_traces=traces,
+            bootstrap_signals={
+                "request_only": True,
+                "learned_normalization_rules": {},
+                "cookies": {},
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint="https://www.wir-machen-druck.de/wmdrest/article/get-price",
+            payload_template={},
+            confidence=0.8,
+            notes="",
+        )
+
+        agent = ExecutionAgent()
+        seen_payload: dict[str, object] | None = None
+
+        def fake_urlopen(req, timeout=15):
+            nonlocal seen_payload
+            body = (getattr(req, "data", None) or b"").decode("utf-8", errors="replace")
+            seen_payload = json.loads(body) if body else None
+            return FakeHttpResponse(
+                json.dumps(
+                    {
+                        "code": 200,
+                        "message": "OK",
+                        "data": {
+                            "response": {
+                                "quantity": 250,
+                                "price": "142.57",
+                                "priceWithTax": "169.66",
+                                "currency": "EUR",
+                            }
+                        },
+                    }
+                ),
+                content_type="application/json",
+            )
+
+        with mock.patch("price_extractor.agents.request.urlopen", side_effect=fake_urlopen):
+            result, replay_summary = agent._try_http_replay(state)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(replay_summary.get("selectedVia"), "wir_machen_druck_price_scale")
+        self.assertIsNotNone(seen_payload)
+        self.assertEqual(str(seen_payload.get("priceScaleId")), "65315686")
+        self.assertEqual(seen_payload.get("quantity"), "250")
+        self.assertFalse(bool(seen_payload.get("isIndividualQuantity")))
+        self.assertEqual(result.accepted_configuration.get("quantity"), 250)
+        self.assertIsNotNone(result.price_value)
+        self.assertGreater(float(result.price_value or 0.0), 0.0)
+        self.assertEqual(dict(result.raw_response_summary.get("requestTemplateApplied") or {}).get("kind"), "wir_machen_druck_price_scale")
+
+        state.extraction = result
+        validation = ValidationAgent().run(state)
+        self.assertTrue(validation.is_valid)
+        self.assertEqual(validation.mismatches, [])
+
+    def test_option_key_aliases_cover_multilingual_printing_terms(self) -> None:
+        aliases = cli._option_key_aliases("Zusätzlicher_Umschlag")
+        self.assertIn("cover", aliases)
+
+        aliases = cli._option_key_aliases("Ausführung Innenteil")
+        self.assertIn("print", aliases)
+
+        aliases = cli._option_key_aliases("Auflage")
+        self.assertIn("quantity", aliases)
+
+    def test_validation_allows_quantity_and_format_normalization(self) -> None:
+        target = TargetInput(
+            site_name="print24.com",
+            product_url="https://print24.com/de/druckprodukte/broschueren/broschueren-klammerheftung-greenline",
+            product_type="brochure",
+            options={"quantity": 250, "format": "A5"},
+            bootstrap_signals={"request_only": True, "learned_normalization_rules": {}},
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(strategy=Strategy.HYBRID, endpoint="https://print24.com/api/de/itemmaster/calculation/productDetails/", payload_template={}, confidence=0.9, notes="")
+        state.extraction = ExtractionResult(
+            success=True,
+            accepted_configuration={"quantity": "250 Stück", "format": "148 x 210 mm DIN A5 Hochformat"},
+            price_value=123.45,
+            currency="EUR",
+            raw_response_summary={"effectiveRequestedOptions": {"quantity": 250, "format": "A5"}, "replay": "http", "fallback": "none"},
+        )
+
+        result = ValidationAgent().run(state)
+        self.assertTrue(result.is_valid)
+        self.assertEqual(result.mismatches, [])
+
+    def test_replay_candidate_selection_for_saxoprint_and_onlineprinters(self) -> None:
+        saxo_target = TargetInput(
+            site_name="saxoprint.de",
+            product_url="https://www.saxoprint.de/broschueren/broschueren-drucken",
+            product_type="brochure",
+        )
+        saxo_state = RunState(target=saxo_target)
+        saxo_state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint="https://api.saxoprint.de/product-configuration/get-product-prices",
+            payload_template={},
+            confidence=0.9,
+            notes="",
+        )
+        saxo_state.observation = ObservationBundle(
+            has_script_heavy_ui=True,
+            has_api_calls=True,
+            requires_session=True,
+            endpoint_rankings=[
+                {"url": "https://api.saxoprint.de/product-configuration/get-product-prices", "score": 30},
+                {"url": "https://api.saxoprint.de/product-configuration/get-delivery-prices", "score": 20},
+            ],
+        )
+
+        online_target = TargetInput(
+            site_name="onlineprinters.de",
+            product_url="https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4",
+            product_type="brochure",
+            network_traces=[{"url": "https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4", "resource_type": "document", "status": 200}],
+        )
+        online_state = RunState(target=online_target)
+        online_state.plan = StrategyPlan(strategy=Strategy.HYBRID, endpoint=None, payload_template={}, confidence=0.7, notes="")
+        online_state.observation = ObservationBundle(
+            has_script_heavy_ui=True,
+            has_api_calls=True,
+            requires_session=True,
+            endpoint_rankings=[
+                {"url": "https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4", "score": 25},
+            ],
+        )
+
+        saxo_candidates = ExecutionAgent._build_http_replay_candidates(saxo_state)
+        online_candidates = ExecutionAgent._build_http_replay_candidates(online_state)
+
+        self.assertEqual(saxo_candidates[0]["url"], "https://api.saxoprint.de/product-configuration/get-product-prices")
+        self.assertEqual(online_candidates[0]["url"], "https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4")
+        self.assertEqual(sum(1 for row in online_candidates if row["url"] == online_target.product_url), 1)
+
+    def test_onlineprinters_prevalidation_and_template_synthesis(self) -> None:
+        bootstrap = load_fixture("onlineprinters_enriched_bootstrap.json")
+        traces = load_fixture("onlineprinters_template_trace.json")
+
+        valid = cli._prevalidate_requested_options({"quantity": 250, "seitig": 16}, bootstrap)
+        invalid = cli._prevalidate_requested_options({"seitig": 24}, bootstrap)
+
+        self.assertTrue(valid["valid"])
+        self.assertFalse(invalid["valid"])
+        self.assertIn("16-seitig", invalid["unmatched"][0]["suggestions"])
+
+        target = TargetInput(
+            site_name="onlineprinters.de",
+            product_url="https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4",
+            product_type="brochure",
+            options={"quantity": 250, "seitig": 16},
+            network_traces=traces,
+            bootstrap_signals={
+                "option_prevalidation": valid,
+                "request_templates": bootstrap["request_templates"],
+                "option_catalog": bootstrap["option_catalog"],
+                "quantity_signal": bootstrap["quantity_signal"],
+                "request_only": True,
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(strategy=Strategy.HYBRID, endpoint=target.product_url, payload_template={}, confidence=0.7, notes="")
+
+        candidates = build_site_replay_candidates(
+            state,
+            effective_options={"quantity": 250, "seitig": 16},
+            raw_requested_options={"quantity": 250, "seitig": 16},
+        )
+        candidate = next((row for row in candidates if row.get("source") == "onlineprinters_synthesized_template"), None)
+        self.assertIsNotNone(candidate)
+        body_text = candidate["body_text"]
+        self.assertIn("input_var_PBRA444_2_1=16-seitig", body_text)
+        self.assertIn("input_var_PBRA444_3_1=250", body_text)
+        self.assertIn("PBRA444.135.161000", ExecutionAgent._decode_template_text(body_text))
+
+    def test_viaprinto_query_template_synthesis(self) -> None:
+        traces = load_fixture("viaprinto_template_trace.json")
+        target = TargetInput(
+            site_name="viaprinto.de",
+            product_url="https://www.viaprinto.de/-/content_size?PAGES=4&CONTENT_SIZE=210x297&AMOUNT=200",
+            product_type="broschueren",
+            options={"amount": 500, "content_size": "148x210", "pages": 8},
+            network_traces=traces,
+            bootstrap_signals={"request_only": True},
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint=target.product_url,
+            payload_template={},
+            confidence=0.8,
+            notes="",
+        )
+
+        candidates = build_site_replay_candidates(
+            state,
+            effective_options={"amount": 500, "content_size": "148x210", "pages": 8},
+            raw_requested_options={"amount": 500, "content_size": "148x210", "pages": 8},
+        )
+
+        candidate = next((row for row in candidates if row.get("source") == "viaprinto_synthesized_query"), None)
+        self.assertIsNotNone(candidate)
+        self.assertIn("AMOUNT=500", str(candidate.get("url") or ""))
+        self.assertIn("CONTENT_SIZE=148x210", str(candidate.get("url") or ""))
+        self.assertIn("PAGES=8", str(candidate.get("url") or ""))
+        applied = dict(candidate.get("request_template_applied") or {})
+        self.assertEqual(applied.get("kind"), "viaprinto_query_params")
+
+    def test_persists_replay_template_on_deterministic_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "knowledge.db")
+            store = KnowledgeStore(db_path=db_path)
+            try:
+                orchestrator = ExtractionOrchestrator(store)
+
+                target = TargetInput(
+                    site_name="onlineprinters.de",
+                    product_url="https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4",
+                    product_type="brochure",
+                    options={"quantity": 250},
+                    bootstrap_signals={"request_only": True, "learned_normalization_rules": {}},
+                )
+                state = RunState(target=target, max_attempts=1)
+
+                orchestrator.discovery.run = mock.Mock(
+                    return_value=ObservationBundle(has_script_heavy_ui=True, has_api_calls=True, requires_session=True)
+                )
+                orchestrator.feasibility.run = mock.Mock(
+                    return_value=FeasibilityResult(
+                        feasible=True,
+                        complexity=Complexity.HIGH,
+                        recommended_strategy=Strategy.HYBRID,
+                        rationale="",
+                    )
+                )
+                orchestrator.planner.run = mock.Mock(
+                    return_value=StrategyPlan(
+                        strategy=Strategy.HYBRID,
+                        endpoint="https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4",
+                        payload_template={},
+                        confidence=0.8,
+                        notes="",
+                    )
+                )
+                orchestrator.executor.run = mock.Mock(
+                    return_value=ExtractionResult(
+                        success=True,
+                        accepted_configuration={"quantity": 250},
+                        price_value=123.45,
+                        currency="EUR",
+                        raw_response_summary={
+                            "endpoint": "https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4",
+                            "fallback": "none",
+                            "requestTemplateApplied": {"kind": "onlineprinters_setlink_form", "fieldsUpdated": []},
+                        },
+                    )
+                )
+                orchestrator.validator.run = mock.Mock(return_value=ValidationResult(is_valid=True, mismatches=[]))
+
+                orchestrator.run(state)
+
+                templates = store.get_site_replay_templates("onlineprinters.de")
+                self.assertEqual(len(templates), 1)
+                self.assertEqual(templates[0]["templateKind"], "onlineprinters_setlink_form")
+            finally:
+                store.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

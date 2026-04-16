@@ -1,0 +1,40 @@
+[
+  {
+    "url": "https://www.wir-machen-druck.de/wmdrest/article/get-sorten-auflage",
+    "method": "POST",
+    "resource_type": "xhr",
+    "status": 200,
+    "request_content_type": "application/x-www-form-urlencoded; charset=utf-8",
+    "response_content_type": "application/json",
+    "request_headers": {
+      "content-type": "application/x-www-form-urlencoded; charset=utf-8",
+      "accept": "*/*",
+      "x-requested-with": "xmlhttprequest"
+    },
+    "response_headers": {
+      "content-type": "application/json"
+    },
+    "post_data": "{\"token\":\"REDACTED\",\"isIndividualQuantity\":false,\"categoryId\":\"9435\",\"shopId\":\"0\",\"userId\":\"0\",\"articleId\":\"973\",\"substrateId\":\"1222796\",\"quantity\":\"1\",\"priceScaleId\":\"65315670\",\"additionalUpsells\":{},\"ownPrintData\":\"1\",\"deliveryOption\":\"STANDARD_PRODUCTION\",\"forwardingShipment\":\"\"}",
+    "post_data_preview": "{\"token\":\"REDACTED\",\"isIndividualQuantity\":false,\"categoryId\":\"9435\",\"shopId\":\"0\",\"userId\":\"0\",\"articleId\":\"973\",\"substrateId\":\"1222796\",\"quantity\":\"1\",\"priceScaleId\":\"65315670\",\"additionalUpsells\":{},\"ownPrintData\":\"1\",\"deliveryOption\":\"STANDARD_PRODUCTION\",\"forwardingShipment\":\"\"}",
+    "response_body_preview": "{\"code\":200,\"message\":\"OK\",\"data\":{\"response\":[{\"id\":65315670,\"wert\":1,\"preis\":7.36,\"is_selected\":1},{\"id\":65315686,\"wert\":250,\"preis\":142.57,\"is_selected\":0}]}}"
+  },
+  {
+    "url": "https://www.wir-machen-druck.de/wmdrest/article/get-price",
+    "method": "POST",
+    "resource_type": "xhr",
+    "status": 200,
+    "request_content_type": "application/x-www-form-urlencoded; charset=utf-8",
+    "response_content_type": "application/json",
+    "request_headers": {
+      "content-type": "application/x-www-form-urlencoded; charset=utf-8",
+      "accept": "*/*",
+      "x-requested-with": "xmlhttprequest"
+    },
+    "response_headers": {
+      "content-type": "application/json"
+    },
+    "post_data": "{\"token\":\"REDACTED\",\"isIndividualQuantity\":true,\"categoryId\":\"9435\",\"shopId\":\"0\",\"userId\":\"0\",\"articleId\":\"973\",\"substrateId\":\"1222796\",\"quantity\":\"1\",\"additionalUpsells\":{},\"ownPrintData\":\"1\",\"deliveryOption\":\"STANDARD_PRODUCTION\",\"forwardingShipment\":\"\"}",
+    "post_data_preview": "{\"token\":\"REDACTED\",\"isIndividualQuantity\":true,\"categoryId\":\"9435\",\"shopId\":\"0\",\"userId\":\"0\",\"articleId\":\"973\",\"substrateId\":\"1222796\",\"quantity\":\"1\",\"additionalUpsells\":{},\"ownPrintData\":\"1\",\"deliveryOption\":\"STANDARD_PRODUCTION\",\"forwardingShipment\":\"\"}",
+    "response_body_preview": "{\"code\":200,\"message\":\"OK\",\"data\":{\"response\":{\"quantity\":1,\"price\":\"7.36\",\"priceWithTax\":\"8.76\",\"currency\":\"EUR\"}}}"
+  }
+]

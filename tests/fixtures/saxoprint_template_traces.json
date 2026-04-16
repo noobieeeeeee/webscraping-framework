@@ -1,0 +1,42 @@
+[
+  {
+    "url": "https://api.saxoprint.de/product-configuration/get-product-values",
+    "method": "POST",
+    "resource_type": "xhr",
+    "status": 200,
+    "request_content_type": "application/json",
+    "response_content_type": "application/json; charset=utf-8",
+    "request_headers": {
+      "content-type": "application/json",
+      "accept": "application/json, text/plain, */*"
+    },
+    "response_headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "post_data": "{\"productGroupId\":305,\"propertyConfiguration\":[],\"propertyConfigurationCode\":null}",
+    "post_data_preview": "{\"productGroupId\":305,\"propertyConfiguration\":[],\"propertyConfigurationCode\":null}",
+    "post_data_len": 82,
+    "post_data_truncated": false,
+    "response_body_preview": "{\"propertyOptions\":[{\"id\":44,\"isRange\":true,\"propertyValueOptions\":[{\"id\":600},{\"id\":750},{\"id\":800},{\"id\":900},{\"id\":1000},{\"id\":1100},{\"id\":1200},{\"id\":1250}]}]}"
+  },
+  {
+    "url": "https://api.saxoprint.de/product-configuration/get-product-prices",
+    "method": "POST",
+    "resource_type": "xhr",
+    "status": 200,
+    "request_content_type": "application/json",
+    "response_content_type": "application/json; charset=utf-8",
+    "request_headers": {
+      "content-type": "application/json",
+      "accept": "application/json, text/plain, */*"
+    },
+    "response_headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "post_data": "{\"productGroupId\":305,\"customerNumber\":0,\"propertyConfiguration\":[{\"propertyId\":34,\"value\":257},{\"propertyId\":44,\"value\":1000},{\"propertyId\":9,\"value\":48}],\"printRuns\":[1000,1100,1200,1250],\"deliverySplitPrintRuns\":[]}",
+    "post_data_preview": "{\"productGroupId\":305,\"customerNumber\":0,\"propertyConfiguration\":[{\"propertyId\":34,\"value\":257},{\"propertyId\":44,\"value\":1000},{\"propertyId\":9,\"value\":48}],\"printRuns\":[1000,1100,1200,1250],\"deliverySplitPrintRuns\":[]}",
+    "post_data_len": 0,
+    "post_data_truncated": false,
+    "response_body_preview": "{\"priceGross\":423.05}"
+  }
+]

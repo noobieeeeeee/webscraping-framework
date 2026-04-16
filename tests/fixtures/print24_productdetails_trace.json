@@ -1,0 +1,14 @@
+{
+  "url": "https://print24.com/api/de/itemmaster/calculation/productDetails/",
+  "method": "POST",
+  "resource_type": "xhr",
+  "status": 200,
+  "request_content_type": "application/json;charset=UTF-8",
+  "response_content_type": "application/json",
+  "request_headers": {
+    "accept": "application/json",
+    "content-type": "application/json;charset=UTF-8",
+    "portal": "print24"
+  },
+  "post_data": "{\"item_group_id\":2,\"properties\":[{\"id\":\"222\",\"name\":\"format\"},{\"id\":\"339\",\"name\":\"quantity\"}],\"product_alias_id\":388,\"delivery_country_code\":\"DE\"}"
+}

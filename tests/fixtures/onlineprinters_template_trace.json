@@ -1,0 +1,20 @@
+[
+  {
+    "url": "https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4",
+    "method": "POST",
+    "resource_type": "xhr",
+    "status": 200,
+    "request_content_type": "application/WS-targetISO-8859-1xWS-target",
+    "response_content_type": "application/json; charset=utf-8",
+    "request_headers": {
+      "content-type": "application/WS-targetISO-8859-1xWS-target",
+      "accept": "application/json, text/javascript, */*; q=0.01",
+      "x-requested-with": "XMLHttpRequest"
+    },
+    "response_headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "post_data": "Ctx=fixture&SetLink=https%3A%2F%2Fwww.onlineprinters.de%2Fp%2Fbroschueren-klammerheftung-din-a4%3Fdepvar_index_setparent%3D%253CPBRA444%253E%253CPBRA444.135.081000%253E&input_var_PBRA444_2_1=8-seitig&input_var_PBRA444_3_1=1000",
+    "response_body_preview": "{\"Result\":0}"
+  }
+]

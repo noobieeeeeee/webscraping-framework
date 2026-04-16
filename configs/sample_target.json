@@ -1,0 +1,18 @@
+{
+  "site_name": "onlineprinters",
+  "product_url": "https://www.onlineprinters.example/product/configurator",
+  "product_type": "flyer",
+  "observed_requests": [
+    "https://www.onlineprinters.example/api/session/bootstrap",
+    "https://www.onlineprinters.example/api/pricing/calculate",
+    "https://www.onlineprinters.example/graphql"
+  ],
+  "expected_price": 26.25,
+  "expected_currency": "EUR",
+  "options": {
+    "format": "A5",
+    "material": "130gsm",
+    "quantity": 250,
+    "print_color": "4_4"
+  }
+}
