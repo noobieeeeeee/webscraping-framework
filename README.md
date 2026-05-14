@@ -394,7 +394,6 @@ CLI now supports repeatable per-option overrides via `--option key=value` with s
 Use `--require-matched-options` when you want the run to fail if requested options are not present in the exported option catalog; when catalog data is available, the CLI now fails fast with suggested values before execution.
 Recon snapshots are persisted in the local knowledge DB with a TTL (default: 7 days) and can be reused automatically in pricing runs or recon-only flows to avoid repeating browser recon.
 Cached pricing runs now refresh recon once when traces appear to have drifted (for example: missing replay traces, request errors, HTML instead of structured pricing data, or request-only replay failure).
-Onlineprinters request replay now synthesizes the request body from captured `SetLink` / form templates plus catalog-backed option matches instead of always replaying the stale captured default body.
 Bootstrap also infers option dependency edges from DOM metadata hints and surfaces quantity threshold behavior when both presets and manual input exist.
 Bootstrap now performs limited active probing (small interaction budget) to detect cross-option dependency effects and reports active dependency edge counts.
 Per-run artifacts are written by default under `.data/runs/<site>/<unit_id>/` with `summary.json`, `spec.json`, `bootstrap.json`, `network_traces.json`, `option_catalog.json`, `drift_report.json`, and `state_snapshot.json`.
@@ -404,7 +403,7 @@ CLI now supports checkpoint/resume for long jobs:
 - Failed units are skipped by default on manifest runs until `--retry-failed` is provided.
 - Single URL runs always execute immediately (no checkpoint-based skipping).
 - Checkpoint JSON is persisted after every processed unit.
-Template synthesis and replay candidate generation are implemented through site adapters (currently including Onlineprinters, Print24, Saxoprint, Viaprinto, and Wir-machen-druck). Sites without adapter coverage still rely on captured replay bodies unless additional logic is added.
+Template synthesis and replay candidate generation are implemented through site adapters. Sites without adapter coverage still rely on captured replay bodies unless additional logic is added.
 
 Offline regression tests are available via:
 
