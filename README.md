@@ -69,26 +69,6 @@ Note: `--request-only` cannot be combined with `--recon-only`, `--require-matche
 python -m price_extractor.cli --url "https://example.com/product/xyz" --request-only --verbose --fail-on-invalid
 ```
 
-Copy/paste quick tests (real sites):
-
-Onlineprinters:
-
-```bash
-python -m price_extractor.cli --url "https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4" --request-only --option quantity=250 --option seitig=16 --verbose --fail-on-invalid
-```
-
-Print24:
-
-```bash
-python -m price_extractor.cli --url "https://print24.com/de/druckprodukte/broschueren/broschueren-klammerheftung-greenline" --request-only --option quantity=250 --option "format=A5" --option material=130gsm --verbose --fail-on-invalid
-```
-
-Saxoprint:
-
-```bash
-python -m price_extractor.cli --url "https://www.saxoprint.de/broschueren/broschueren-drucken" --request-only --option quantity=250 --option "format=A5" --option material=170gsm --option umschlag_material=130gsm --option umschlag_seitenanzahl=4 --verbose --fail-on-invalid
-```
-
 Recon-only mode (discover visible options/endpoints and cache locally, skip pricing):
 
 ```bash
@@ -266,13 +246,13 @@ python -m price_extractor.cli --manifest-csv configs/sample_manifest.csv --reque
 For one-URL-per-file matrix CSVs (rows only contain configuration columns, no `url` column), pass a default URL:
 
 ```bash
-python -m price_extractor.cli --manifest-csv d:/Download/onlineprinters_brochures_kombination_redone.csv --manifest-csv-url "https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4" --site-name onlineprinters --request-only --results-jsonl .data/runs/onlineprinters-matrix.jsonl
+python -m price_extractor.cli --manifest-csv configs/sample_matrix.csv --manifest-csv-url "https://example.com/product/xyz" --site-name example-site --request-only --results-jsonl .data/runs/matrix-results.jsonl
 ```
 
 Use compact row output for very large runs (default):
 
 ```bash
-python -m price_extractor.cli --manifest-csv d:/Download/onlineprinters_brochures_kombination_redone.csv --manifest-csv-url "https://www.onlineprinters.de/p/broschueren-klammerheftung-din-a4" --results-jsonl .data/runs/onlineprinters-matrix.jsonl --results-jsonl-mode compact
+python -m price_extractor.cli --manifest-csv configs/sample_matrix.csv --manifest-csv-url "https://example.com/product/xyz" --results-jsonl .data/runs/matrix-results.jsonl --results-jsonl-mode compact
 ```
 
 Streaming per-unit output for long manifest runs (JSONL):
@@ -374,7 +354,7 @@ python -m price_extractor.cli --manifest-file configs/sample_manifest.json --sta
 Export long-run JSONL results to CSV for quick analysis:
 
 ```bash
-price-results-export --jsonl .data/runs/onlineprinters-matrix.jsonl --csv .data/runs/onlineprinters-matrix.csv
+price-results-export --jsonl .data/runs/results.jsonl --csv .data/runs/results.csv
 ```
 
 ## Notes
@@ -394,8 +374,8 @@ CLI now supports repeatable per-option overrides via `--option key=value` with s
 Use `--require-matched-options` when you want the run to fail if requested options are not present in the exported option catalog; when catalog data is available, the CLI now fails fast with suggested values before execution.
 Recon snapshots are persisted in the local knowledge DB with a TTL (default: 7 days) and can be reused automatically in pricing runs or recon-only flows to avoid repeating browser recon.
 Cached pricing runs now refresh recon once when traces appear to have drifted (for example: missing replay traces, request errors, HTML instead of structured pricing data, or request-only replay failure).
-Onlineprinters request replay now synthesizes the request body from captured `SetLink` / form templates plus catalog-backed option matches instead of always replaying the stale captured default body.
-Bootstrap also infers option dependency edges from DOM metadata hints and surfaces quantity threshold behavior when both presets and manual input exist.
+Request replay can synthesize dynamic payloads from captured templates and catalog-backed option matches instead of always replaying stale default bodies.
+Bootstrap infers option dependency edges from DOM metadata hints and surfaces quantity threshold behavior when both presets and manual input exist.
 Bootstrap now performs limited active probing (small interaction budget) to detect cross-option dependency effects and reports active dependency edge counts.
 Per-run artifacts are written by default under `.data/runs/<site>/<unit_id>/` with `summary.json`, `spec.json`, `bootstrap.json`, `network_traces.json`, `option_catalog.json`, `drift_report.json`, and `state_snapshot.json`.
 Some artifacts can contain session-related data (for example cookies and request metadata). Treat `.data/` as sensitive local runtime output and avoid sharing or committing it.
@@ -404,7 +384,7 @@ CLI now supports checkpoint/resume for long jobs:
 - Failed units are skipped by default on manifest runs until `--retry-failed` is provided.
 - Single URL runs always execute immediately (no checkpoint-based skipping).
 - Checkpoint JSON is persisted after every processed unit.
-Template synthesis and replay candidate generation are implemented through site adapters (currently including Onlineprinters, Print24, Saxoprint, Viaprinto, and Wir-machen-druck). Sites without adapter coverage still rely on captured replay bodies unless additional logic is added.
+Template synthesis and replay candidate generation are implemented through pluggable site adapters. Sites without adapter coverage still rely on captured replay bodies unless additional site-specific logic is added. See [CONTRIBUTING.md](CONTRIBUTING.md) for instructions on adding new sites.
 
 Offline regression tests are available via:
 

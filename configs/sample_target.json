@@ -1,11 +1,11 @@
 {
-  "site_name": "onlineprinters",
-  "product_url": "https://www.onlineprinters.example/product/configurator",
-  "product_type": "flyer",
+  "site_name": "example-site",
+  "product_url": "https://example.com/product/configurator",
+  "product_type": "brochure",
   "observed_requests": [
-    "https://www.onlineprinters.example/api/session/bootstrap",
-    "https://www.onlineprinters.example/api/pricing/calculate",
-    "https://www.onlineprinters.example/graphql"
+    "https://example.com/api/session/bootstrap",
+    "https://example.com/api/pricing/calculate",
+    "https://example.com/api/options"
   ],
   "expected_price": 26.25,
   "expected_currency": "EUR",
@@ -13,6 +13,6 @@
     "format": "A5",
     "material": "130gsm",
     "quantity": 250,
-    "print_color": "4_4"
+    "color": "4c"
   }
 }

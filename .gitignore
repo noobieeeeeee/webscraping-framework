@@ -31,11 +31,12 @@ saxoprint_mappings.json
 onlineprinters_request_modification.md
 print24_feasibility_notes.md
 
-# Site-specific tests and fixtures (captured data, bootstrap artifacts, etc.)
+# Site-specific data files and tests
+value_maps/
 tests/fixtures/
+configs/sample_async_extraction_*.py
 configs/
 adapters/
-value_maps/
 src/.data/
 
 .claude/
