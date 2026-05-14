@@ -8,6 +8,8 @@ import json
 import random
 import re
 import time
+import unicodedata
+from pathlib import Path
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -26,10 +28,162 @@ from .models import (
     StrategyPlan,
     ValidationResult,
 )
-from .site_adapters import build_site_replay_candidates
+from .json_adapters import (
+    build_adapter_http_candidate,
+    extract_adapter_result,
+    load_json_adapters_with_diagnostics,
+    match_json_adapter_with_diagnostics,
+)
+from .site_adapters import build_site_replay_candidates, load_generated_site_adapters
 
 
 class DiscoveryAgent:
+    _REQUEST_FAMILY_TOKENS = {
+        "pricing_pipeline": {
+            "price",
+            "pricing",
+            "quote",
+            "calculate",
+            "productdetails",
+            "final_prices",
+            "total_gross",
+            "total_net",
+            "price-matrix",
+            "price_matrix",
+            "pricescale",
+            "get-product-prices",
+            "product-configuration",
+        },
+        "schema_pipeline": {
+            "schema",
+            "options",
+            "option",
+            "properties",
+            "property",
+            "propertyconfiguration",
+            "repo",
+            "catalog",
+            "values",
+            "value",
+        },
+        "quantity_pipeline": {
+            "quantity",
+            "qty",
+            "auflage",
+            "matrix",
+            "scale",
+            "pricescale",
+            "price-matrix",
+            "price_matrix",
+        },
+        "validation_pipeline": {
+            "validate",
+            "validation",
+            "summary",
+            "selected",
+            "configuration",
+            "check",
+            "details",
+            "verify",
+        },
+    }
+
+    _INFRASTRUCTURE_TOKENS = {
+        "translation",
+        "translations",
+        "i18n",
+        "widget",
+        "config",
+        "auth",
+        "auth-check",
+        "countries",
+        "country",
+        "chatbot",
+        "analytics",
+        "consent",
+        "tracking",
+        "pixel",
+        "gtm",
+        "segment",
+        "doubleclick",
+        "usercentrics",
+    }
+
+    _NOISE_TOKENS = {
+        "analytics",
+        "tracking",
+        "pixel",
+        "gtm",
+        "fonts",
+        "doubleclick",
+        "/_nuxt/",
+        "/builds/meta/",
+        "/meta/",
+        "deeplink",
+        "kameleoon",
+        "useinsider",
+        "userlike",
+        "linkedin",
+        "googletagmanager",
+        "consent",
+        "segment",
+        "bing.com",
+        "usercentrics",
+        "privacy-proxy",
+        "consent-api",
+        "typekit",
+    }
+
+    _PRICING_SEMANTIC_TOKENS = {
+        "price",
+        "pricing",
+        "quote",
+        "calculate",
+        "final_prices",
+        "total_gross",
+        "total_net",
+        "total",
+        "gross",
+        "net",
+        "amount",
+        "productdetails",
+    }
+
+    _QUANTITY_SEMANTIC_TOKENS = {
+        "quantity",
+        "qty",
+        "auflage",
+        "pricescale",
+        "price_matrix",
+        "price-matrix",
+        "matrix",
+        "scale",
+    }
+
+    _CONFIG_SEMANTIC_TOKENS = {
+        "schema",
+        "options",
+        "option",
+        "properties",
+        "property",
+        "propertyconfiguration",
+        "configuration",
+        "repo",
+        "catalog",
+        "values",
+        "value",
+    }
+
+    _VALIDATION_SEMANTIC_TOKENS = {
+        "validate",
+        "validation",
+        "summary",
+        "selected",
+        "check",
+        "details",
+        "verify",
+    }
+
     @staticmethod
     def _is_api_like(url: str) -> bool:
         lowered = url.lower()
@@ -43,6 +197,210 @@ class DiscoveryAgent:
             return json.loads(raw)
         except Exception:
             return None
+
+    @staticmethod
+    def _normalize_replay_url(raw_url: str) -> dict[str, Any]:
+        text = str(raw_url or "").strip()
+        lowered = text.lower()
+        if not lowered:
+            return {
+                "raw": "",
+                "normalizedEndpoint": "",
+                "normalizedPath": "",
+                "pathTokens": [],
+                "urlTokens": [],
+                "pathSegments": [],
+            }
+
+        parsed = urlsplit(lowered)
+        scheme = parsed.scheme.lower()
+        netloc = parsed.netloc.lower()
+        path = re.sub(r"/+", "/", unquote(parsed.path or "")).strip()
+        path = re.sub(r"/+", "/", path)
+        if path != "/":
+            path = path.rstrip("/")
+
+        normalized_segments: list[str] = []
+        for segment in [part for part in path.split("/") if part]:
+            token = re.sub(r"[^a-z0-9]+", "", segment.lower())
+            if token:
+                normalized_segments.append(token)
+
+        normalized_path = "/" + "/".join(normalized_segments) if normalized_segments else ""
+        normalized_endpoint = urlunsplit((scheme, netloc, normalized_path, "", ""))
+        path_tokens = normalized_segments
+        url_tokens = [token for token in re.split(r"[^a-z0-9]+", lowered) if token]
+        return {
+            "raw": text,
+            "normalizedEndpoint": normalized_endpoint,
+            "normalizedPath": normalized_path,
+            "pathTokens": path_tokens,
+            "urlTokens": url_tokens,
+            "pathSegments": normalized_segments,
+            "scheme": scheme,
+            "netloc": netloc,
+        }
+
+    @staticmethod
+    def _trace_contains_semantic_tokens(
+        trace: dict[str, Any],
+        tokens: set[str],
+    ) -> bool:
+        if not tokens:
+            return False
+        url = str(trace.get("url", "")).lower()
+        post_data = str(trace.get("post_data") or "").lower()
+        response_preview = str(trace.get("response_body_preview") or "").lower()
+        response_type = str(trace.get("response_content_type", "")).lower()
+        request_type = str(trace.get("request_content_type", "")).lower()
+        haystacks = [url, post_data, response_preview, response_type, request_type]
+        return any(any(token in haystack for haystack in haystacks) for token in tokens)
+
+    @classmethod
+    def _score_trace_match_candidate(
+        cls,
+        endpoint_info: dict[str, Any],
+        trace: dict[str, Any],
+    ) -> tuple[float, str, list[str]]:
+        trace_info = cls._normalize_replay_url(str(trace.get("url", "")))
+        endpoint_normalized = str(endpoint_info.get("normalizedEndpoint") or "")
+        trace_normalized = str(trace_info.get("normalizedEndpoint") or "")
+        endpoint_path = str(endpoint_info.get("normalizedPath") or "")
+        trace_path = str(trace_info.get("normalizedPath") or "")
+        endpoint_tokens = list(endpoint_info.get("pathTokens") or [])
+        trace_tokens = list(trace_info.get("pathTokens") or [])
+
+        trace_url = str(trace.get("url", ""))
+        method = str(trace.get("method", "GET")).upper()
+        resource_type = str(trace.get("resource_type", "")).lower()
+        status = int(trace.get("status", 0) or 0)
+        response_type = str(trace.get("response_content_type", "") or "").lower()
+        request_type = str(trace.get("request_content_type", "") or "").lower()
+        has_post_data = bool(trace.get("post_data"))
+        has_preview = bool(str(trace.get("response_body_preview") or "").strip())
+
+        candidate_tags: set[str] = set()
+        for token in endpoint_tokens + trace_tokens:
+            if token in cls._PRICING_SEMANTIC_TOKENS:
+                candidate_tags.add("pricing_semantics")
+            if token in cls._QUANTITY_SEMANTIC_TOKENS:
+                candidate_tags.add("quantity_semantics")
+            if token in cls._CONFIG_SEMANTIC_TOKENS:
+                candidate_tags.add("config_semantics")
+
+        if cls._trace_contains_semantic_tokens(trace, cls._PRICING_SEMANTIC_TOKENS):
+            candidate_tags.add("pricing_semantics")
+        if cls._trace_contains_semantic_tokens(trace, cls._QUANTITY_SEMANTIC_TOKENS):
+            candidate_tags.add("quantity_semantics")
+        if cls._trace_contains_semantic_tokens(trace, cls._CONFIG_SEMANTIC_TOKENS):
+            candidate_tags.add("config_semantics")
+
+        match_strategy = "semantic_overlap"
+        confidence = 0.0
+        reasons: list[str] = []
+
+        if endpoint_normalized and endpoint_normalized == trace_normalized:
+            match_strategy = "normalized_exact"
+            confidence = 1.0
+            reasons.append("normalized_endpoint_match")
+        elif endpoint_path and endpoint_path == trace_path:
+            match_strategy = "normalized_path_exact"
+            confidence = 0.95
+            reasons.append("normalized_path_match")
+        else:
+            endpoint_prefix = endpoint_path.rstrip("/")
+            trace_prefix = trace_path.rstrip("/")
+            if endpoint_prefix and trace_prefix and (
+                trace_prefix.startswith(endpoint_prefix) or endpoint_prefix.startswith(trace_prefix)
+            ):
+                match_strategy = "path_prefix"
+                confidence = 0.84
+                reasons.append("path_prefix_overlap")
+            else:
+                endpoint_base = endpoint_prefix.split("/")[-1] if endpoint_prefix else ""
+                trace_base = trace_prefix.split("/")[-1] if trace_prefix else ""
+                if endpoint_base and trace_base and (endpoint_base in trace_base or trace_base in endpoint_base):
+                    match_strategy = "path_containment"
+                    confidence = 0.78
+                    reasons.append("path_token_containment")
+                else:
+                    endpoint_token_set = set(endpoint_tokens)
+                    trace_token_set = set(trace_tokens)
+                    shared_tokens = endpoint_token_set.intersection(trace_token_set)
+                    if shared_tokens:
+                        union = max(len(endpoint_token_set.union(trace_token_set)), 1)
+                        overlap = len(shared_tokens) / union
+                        confidence = min(0.72, 0.42 + overlap)
+                        reasons.append(f"shared_path_tokens:{len(shared_tokens)}")
+                        if shared_tokens.intersection(cls._PRICING_SEMANTIC_TOKENS):
+                            reasons.append("pricing_semantics")
+                        if shared_tokens.intersection(cls._QUANTITY_SEMANTIC_TOKENS):
+                            reasons.append("quantity_semantics")
+                        if shared_tokens.intersection(cls._CONFIG_SEMANTIC_TOKENS):
+                            reasons.append("config_semantics")
+                    else:
+                        confidence = 0.0
+
+        if confidence <= 0.0:
+            return 0.0, "no_semantic_match", ["no_path_overlap"]
+
+        if method == "POST":
+            confidence = min(1.0, confidence + 0.08)
+            reasons.append("post_request")
+        elif method == "GET":
+            confidence = min(1.0, confidence + 0.02)
+
+        if resource_type in {"xhr", "fetch"}:
+            confidence = min(1.0, confidence + 0.07)
+            reasons.append("xhr_or_fetch")
+        if 200 <= status < 300:
+            confidence = min(1.0, confidence + 0.05)
+            reasons.append("successful_status")
+        elif status >= 400:
+            confidence = max(0.0, confidence - 0.12)
+            reasons.append("error_status")
+
+        if "json" in response_type:
+            confidence = min(1.0, confidence + 0.06)
+            reasons.append("json_response")
+        if "json" in request_type:
+            confidence = min(1.0, confidence + 0.03)
+            reasons.append("json_request")
+        if has_post_data:
+            confidence = min(1.0, confidence + 0.05)
+            reasons.append("post_body_present")
+        if has_preview:
+            confidence = min(1.0, confidence + 0.02)
+
+        if candidate_tags:
+            reasons.extend(sorted(candidate_tags))
+
+        if not reasons:
+            reasons.append("semantic_match")
+
+        return confidence, match_strategy, reasons
+
+    @classmethod
+    def _build_trace_match_diagnostics(
+        cls,
+        *,
+        endpoint: str,
+        endpoint_info: dict[str, Any],
+        traces: list[dict[str, Any]],
+        matched_trace: dict[str, Any] | None,
+        match_strategy: str,
+        match_confidence: float,
+        mismatch_reason: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "normalizedEndpoint": str(endpoint_info.get("normalizedEndpoint") or ""),
+            "candidateTraceCount": len([trace for trace in traces if str(trace.get("url", "")).strip()]),
+            "matchedTraceUrl": str(matched_trace.get("url", "")) if matched_trace else None,
+            "matchStrategy": match_strategy,
+            "matchConfidence": round(float(match_confidence), 3),
+            "mismatchReason": mismatch_reason,
+            "matchedEndpoint": str(endpoint or ""),
+        }
 
     @staticmethod
     def _collect_json_keys(node: Any, limit: int = 100) -> set[str]:
@@ -61,6 +419,308 @@ class DiscoveryAgent:
 
         walk(node)
         return keys
+
+    @staticmethod
+    def _tokenize_url(url: str) -> set[str]:
+        lowered = str(url or "").lower()
+        tokens = {t for t in re.split(r"[^a-z0-9]+", lowered) if t}
+        for hint in [
+            "productdetails",
+            "price-matrix",
+            "price_matrix",
+            "pricescale",
+            "product-configuration",
+            "get-product-prices",
+        ]:
+            if hint in lowered:
+                tokens.add(hint)
+        return tokens
+
+    @staticmethod
+    def _url_prefix_key(url: str, *, max_segments: int = 2) -> str:
+        parsed = urlsplit(str(url or ""))
+        netloc = str(parsed.netloc or "").lower()
+        segments = [seg for seg in str(parsed.path or "").split("/") if seg]
+        prefix = "/".join(segments[: max(int(max_segments), 1)])
+        return f"{netloc}/{prefix}" if prefix else netloc
+
+    @classmethod
+    def _classify_request_family(
+        cls,
+        *,
+        url: str,
+        payload_keys: set[str],
+        response_keys: set[str],
+        response_preview: str,
+    ) -> tuple[str, dict[str, Any]]:
+        url_tokens = cls._tokenize_url(url)
+        payload_tokens = {str(k).lower() for k in payload_keys}
+        response_tokens = {str(k).lower() for k in response_keys}
+        all_tokens = url_tokens | payload_tokens | response_tokens
+
+        family_scores: dict[str, int] = {k: 0 for k in cls._REQUEST_FAMILY_TOKENS}
+        family_hits: dict[str, list[str]] = {k: [] for k in cls._REQUEST_FAMILY_TOKENS}
+
+        def bump(family: str, tokens: set[str], weight: int) -> None:
+            hits = sorted(all_tokens.intersection(tokens))
+            if hits:
+                family_scores[family] += weight * len(hits)
+                family_hits[family].extend(hits)
+
+        for family, tokens in cls._REQUEST_FAMILY_TOKENS.items():
+            bump(family, tokens, 2)
+
+        preview_lower = str(response_preview or "").lower()
+        if any(token in preview_lower for token in ["final_prices", "total_gross", "total_net"]):
+            family_scores["pricing_pipeline"] += 3
+        if any(token in preview_lower for token in ["price_matrix", "pricescale", "quantity"]):
+            family_scores["quantity_pipeline"] += 2
+
+        infra_hits = sorted(url_tokens.intersection(cls._INFRASTRUCTURE_TOKENS))
+        best_family, best_score = max(family_scores.items(), key=lambda row: row[1])
+        if infra_hits and best_score < 4:
+            return "infrastructure", {
+                "familyScores": family_scores,
+                "familyHits": family_hits,
+                "infraHits": infra_hits,
+                "urlTokens": sorted(url_tokens)[:40],
+            }
+
+        if best_score <= 0:
+            best_family = "unknown"
+
+        return best_family, {
+            "familyScores": family_scores,
+            "familyHits": family_hits,
+            "infraHits": infra_hits,
+            "urlTokens": sorted(url_tokens)[:40],
+        }
+
+    @classmethod
+    def _build_penalties(cls, *, url: str, status: int) -> list[dict[str, Any]]:
+        lowered = str(url or "").lower()
+        penalties: list[dict[str, Any]] = []
+        noise_hits = [token for token in cls._NOISE_TOKENS if token in lowered]
+        if noise_hits:
+            penalties.append({"kind": "noise_tokens", "tokens": noise_hits[:8]})
+        if int(status) >= 400:
+            penalties.append({"kind": "http_error", "status": int(status)})
+        if "premium-filecheck-price" in lowered:
+            penalties.append({"kind": "known_noise_endpoint", "token": "premium-filecheck-price"})
+        return penalties
+
+    @classmethod
+    def _build_payload_signals(
+        cls,
+        *,
+        payload_keys: set[str],
+        response_keys: set[str],
+        post_data: Any,
+        response_preview: str,
+        response_type: str,
+    ) -> dict[str, Any]:
+        payload_tokens = {str(k).lower() for k in payload_keys}
+        response_tokens = {str(k).lower() for k in response_keys}
+        preview_lower = str(response_preview or "").lower()
+
+        price_tokens = {
+            "price",
+            "total",
+            "gross",
+            "net",
+            "amount",
+            "final_prices",
+            "total_gross_value",
+        }
+        quantity_tokens = {"quantity", "qty", "auflage", "pricescale", "price_matrix"}
+
+        return {
+            "hasPostData": bool(post_data),
+            "payloadKeyCount": len(payload_keys),
+            "responseKeyCount": len(response_keys),
+            "payloadHasPriceTokens": bool(payload_tokens.intersection(price_tokens)),
+            "responseHasPriceTokens": bool(response_tokens.intersection(price_tokens))
+            or any(token in preview_lower for token in price_tokens),
+            "payloadHasQuantityTokens": bool(payload_tokens.intersection(quantity_tokens)),
+            "responseHasQuantityTokens": bool(response_tokens.intersection(quantity_tokens))
+            or any(token in preview_lower for token in quantity_tokens),
+            "responseIsJson": "json" in str(response_type or "").lower(),
+        }
+
+    @classmethod
+    def _build_relationship_signature(
+        cls,
+        *,
+        url: str,
+        payload_keys: set[str],
+        response_keys: set[str],
+        response_preview: str,
+        request_family: str,
+    ) -> dict[str, Any]:
+        url_tokens = cls._tokenize_url(url)
+        payload_tokens = {str(k).lower() for k in payload_keys}
+        response_tokens = {str(k).lower() for k in response_keys}
+        preview_lower = str(response_preview or "").lower()
+        combined = url_tokens | payload_tokens | response_tokens
+
+        pricing_hits = combined.intersection(cls._PRICING_SEMANTIC_TOKENS) or {
+            token for token in cls._PRICING_SEMANTIC_TOKENS if token in preview_lower
+        }
+        quantity_hits = combined.intersection(cls._QUANTITY_SEMANTIC_TOKENS) or {
+            token for token in cls._QUANTITY_SEMANTIC_TOKENS if token in preview_lower
+        }
+        config_hits = combined.intersection(cls._CONFIG_SEMANTIC_TOKENS) or {
+            token for token in cls._CONFIG_SEMANTIC_TOKENS if token in preview_lower
+        }
+        validation_hits = combined.intersection(cls._VALIDATION_SEMANTIC_TOKENS) or {
+            token for token in cls._VALIDATION_SEMANTIC_TOKENS if token in preview_lower
+        }
+
+        semantic_tokens = set()
+        semantic_tokens.update(pricing_hits)
+        semantic_tokens.update(quantity_hits)
+        semantic_tokens.update(config_hits)
+        semantic_tokens.update(validation_hits)
+
+        infra_hits = sorted(url_tokens.intersection(cls._INFRASTRUCTURE_TOKENS))
+
+        return {
+            "url": str(url),
+            "url_tokens": url_tokens,
+            "payload_keys": payload_tokens,
+            "response_keys": response_tokens,
+            "semantic_tokens": semantic_tokens,
+            "pricing_semantic": bool(pricing_hits),
+            "quantity_semantic": bool(quantity_hits),
+            "config_semantic": bool(config_hits),
+            "validation_semantic": bool(validation_hits),
+            "infra_hits": infra_hits,
+            "request_family": str(request_family or "unknown"),
+            "url_prefix": cls._url_prefix_key(url),
+        }
+
+    @staticmethod
+    def _merge_relationship_signature(
+        current: dict[str, Any] | None,
+        incoming: dict[str, Any],
+    ) -> dict[str, Any]:
+        if current is None:
+            return dict(incoming)
+
+        current["url_tokens"] = set(current.get("url_tokens", set())) | set(incoming.get("url_tokens", set()))
+        current["payload_keys"] = set(current.get("payload_keys", set())) | set(incoming.get("payload_keys", set()))
+        current["response_keys"] = set(current.get("response_keys", set())) | set(incoming.get("response_keys", set()))
+        current["semantic_tokens"] = set(current.get("semantic_tokens", set())) | set(incoming.get("semantic_tokens", set()))
+        current["pricing_semantic"] = bool(current.get("pricing_semantic") or incoming.get("pricing_semantic"))
+        current["quantity_semantic"] = bool(current.get("quantity_semantic") or incoming.get("quantity_semantic"))
+        current["config_semantic"] = bool(current.get("config_semantic") or incoming.get("config_semantic"))
+        current["validation_semantic"] = bool(current.get("validation_semantic") or incoming.get("validation_semantic"))
+        current["infra_hits"] = sorted(set(current.get("infra_hits", [])) | set(incoming.get("infra_hits", [])))
+
+        if str(current.get("request_family") or "unknown") == "unknown":
+            current["request_family"] = str(incoming.get("request_family") or "unknown")
+
+        return current
+
+    @classmethod
+    def _relationship_score(
+        cls,
+        left: dict[str, Any],
+        right: dict[str, Any],
+    ) -> tuple[float, list[str]]:
+        score = 0.0
+        reasons: list[str] = []
+
+        if left.get("url_prefix") and left.get("url_prefix") == right.get("url_prefix"):
+            score += 0.25
+            reasons.append("shared_url_prefix")
+
+        left_family = str(left.get("request_family") or "unknown")
+        right_family = str(right.get("request_family") or "unknown")
+        if left_family == right_family and left_family != "unknown":
+            weight = 0.12 if left_family == "infrastructure" else 0.18
+            score += weight
+            reasons.append("shared_request_family")
+
+        shared_semantic = set(left.get("semantic_tokens", set())) & set(right.get("semantic_tokens", set()))
+        if len(shared_semantic) >= 2:
+            score += min(0.3, 0.08 + (0.02 * len(shared_semantic)))
+            reasons.append(f"shared_semantic_tokens:{len(shared_semantic)}")
+
+        shared_payload = set(left.get("payload_keys", set())) & set(right.get("payload_keys", set()))
+        if len(shared_payload) >= 2:
+            score += min(0.25, 0.05 + (0.02 * len(shared_payload)))
+            reasons.append(f"shared_payload_keys:{len(shared_payload)}")
+
+        shared_response = set(left.get("response_keys", set())) & set(right.get("response_keys", set()))
+        if len(shared_response) >= 2:
+            score += min(0.25, 0.05 + (0.02 * len(shared_response)))
+            reasons.append(f"shared_response_keys:{len(shared_response)}")
+
+        if left.get("pricing_semantic") and right.get("pricing_semantic"):
+            score += 0.1
+            reasons.append("pricing_semantics")
+
+        if left.get("quantity_semantic") and right.get("quantity_semantic"):
+            score += 0.1
+            reasons.append("quantity_semantics")
+
+        if left.get("config_semantic") and right.get("config_semantic"):
+            score += 0.08
+            reasons.append("config_semantics")
+
+        if left.get("validation_semantic") and right.get("validation_semantic"):
+            score += 0.06
+            reasons.append("validation_semantics")
+
+        return min(1.0, score), reasons
+
+    @classmethod
+    def _build_family_cluster_summaries(
+        cls,
+        rows: list[dict[str, Any]],
+        context_by_url: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        family_members: dict[str, list[str]] = {}
+        for row in rows:
+            url = str(row.get("url", ""))
+            family = str(row.get("request_family") or "unknown")
+            family_members.setdefault(family, []).append(url)
+
+        summaries: dict[str, dict[str, Any]] = {}
+        for family, members in family_members.items():
+            token_counts: dict[str, int] = {}
+            pricing_hits = 0
+            quantity_hits = 0
+            infra_hits = 0
+            for url in members:
+                context = context_by_url.get(url) or {}
+                semantic_tokens = set(context.get("semantic_tokens", set()))
+                for token in semantic_tokens:
+                    token_counts[token] = token_counts.get(token, 0) + 1
+                if context.get("pricing_semantic"):
+                    pricing_hits += 1
+                if context.get("quantity_semantic"):
+                    quantity_hits += 1
+                if context.get("infra_hits"):
+                    infra_hits += 1
+
+            member_count = max(len(members), 1)
+            dominant = [
+                token
+                for token, _count in sorted(token_counts.items(), key=lambda row: row[1], reverse=True)
+            ][:8]
+
+            summaries[family] = {
+                "requestFamily": family,
+                "memberEndpoints": members[:40],
+                "dominantSignals": dominant,
+                "pricingRelevance": round(pricing_hits / member_count, 3),
+                "quantityRelevance": round(quantity_hits / member_count, 3),
+                "infrastructureLikelihood": round(infra_hits / member_count, 3),
+            }
+
+        return summaries
 
     def _classify_trace_role(self, trace: dict[str, Any]) -> tuple[EndpointRole, float]:
         url = str(trace.get("url", "")).lower()
@@ -324,6 +984,7 @@ class DiscoveryAgent:
         endpoint_roles: dict[str, str] = {}
         role_confidence: dict[str, float] = {}
         endpoint_rankings: list[dict[str, Any]] = []
+        relationship_context: dict[str, dict[str, Any]] = {}
         payload_signal_score = 0
         response_signal_score = 0
         saw_quantity_token = False
@@ -334,10 +995,42 @@ class DiscoveryAgent:
             if not trace_url:
                 continue
 
+            post_data = trace.get("post_data") or trace.get("post_data_preview")
+            payload_obj = self._safe_json_loads(post_data if isinstance(post_data, str) else None)
+            payload_keys = self._collect_json_keys(payload_obj) if payload_obj is not None else set()
+            response_preview = str(trace.get("response_body_preview") or "")
+            response_obj = self._safe_json_loads(response_preview if isinstance(response_preview, str) else None)
+            response_keys = self._collect_json_keys(response_obj) if response_obj is not None else set()
+
             role, confidence = self._classify_trace_role(trace)
             endpoint_roles[trace_url] = role.value
             role_confidence[trace_url] = confidence
             endpoint_score = self._score_endpoint_candidate(trace, role, confidence)
+            request_family, semantic_signals = self._classify_request_family(
+                url=trace_url,
+                payload_keys=payload_keys,
+                response_keys=response_keys,
+                response_preview=response_preview,
+            )
+            relationship_signature = self._build_relationship_signature(
+                url=trace_url,
+                payload_keys=payload_keys,
+                response_keys=response_keys,
+                response_preview=response_preview,
+                request_family=request_family,
+            )
+            relationship_context[trace_url] = self._merge_relationship_signature(
+                relationship_context.get(trace_url),
+                relationship_signature,
+            )
+            payload_signals = self._build_payload_signals(
+                payload_keys=payload_keys,
+                response_keys=response_keys,
+                post_data=post_data,
+                response_preview=response_preview,
+                response_type=str(trace.get("response_content_type", "")),
+            )
+            penalties = self._build_penalties(url=trace_url, status=int(trace.get("status", 0) or 0))
             endpoint_rankings.append(
                 {
                     "url": trace_url,
@@ -347,12 +1040,12 @@ class DiscoveryAgent:
                     "role": role.value,
                     "confidence": round(confidence, 3),
                     "score": endpoint_score,
+                    "request_family": request_family,
+                    "semantic_signals": semantic_signals,
+                    "penalties": penalties,
+                    "payload_signals": payload_signals,
                 }
             )
-
-            post_data = trace.get("post_data") or trace.get("post_data_preview")
-            payload_obj = self._safe_json_loads(post_data if isinstance(post_data, str) else None)
-            payload_keys = self._collect_json_keys(payload_obj) if payload_obj is not None else set()
 
             if post_data:
                 payload_signal_score += 1
@@ -405,6 +1098,37 @@ class DiscoveryAgent:
             reverse=True,
         )
 
+        ranked_output = list(endpoint_rankings[:30])
+        if ranked_output:
+            family_summaries = self._build_family_cluster_summaries(ranked_output, relationship_context)
+            for row in ranked_output:
+                url_value = str(row.get("url", ""))
+                context = relationship_context.get(url_value)
+                if not context:
+                    continue
+
+                relationships: list[tuple[float, str, list[str]]] = []
+                for other in ranked_output:
+                    other_url = str(other.get("url", ""))
+                    if not other_url or other_url == url_value:
+                        continue
+                    other_context = relationship_context.get(other_url)
+                    if not other_context:
+                        continue
+                    confidence, reasons = self._relationship_score(context, other_context)
+                    if confidence >= 0.35:
+                        relationships.append((confidence, other_url, reasons))
+
+                relationships.sort(key=lambda item: item[0], reverse=True)
+                top_relationships = relationships[:4]
+                row["relatedEndpoints"] = [item[1] for item in top_relationships]
+                row["relationshipReasons"] = {item[1]: item[2] for item in top_relationships}
+                row["relationshipConfidence"] = {item[1]: round(item[0], 3) for item in top_relationships}
+
+                family = str(row.get("request_family") or "unknown")
+                if family in family_summaries:
+                    row["family_cluster_summary"] = family_summaries[family]
+
         endpoint_candidates = [
             str(row.get("url"))
             for row in endpoint_rankings
@@ -430,7 +1154,7 @@ class DiscoveryAgent:
             has_quantity_threshold_behavior=has_quantity_threshold_behavior,
             has_manual_quantity_input=has_manual_quantity_input,
             has_preset_quantities=has_preset_quantities,
-            endpoint_rankings=endpoint_rankings[:30],
+            endpoint_rankings=ranked_output,
         )
 
 
@@ -896,6 +1620,72 @@ class ExecutionAgent:
             return None
         return max(candidates, key=lambda row: row[0])[1]
 
+    _PRINT24_HARDCODED_FORMAT_MAP: dict[str, str] = {
+        "a5": "268", "din a5": "268", "din-a5": "268", "din_a5": "268",
+        "a6": "222", "din a6": "222", "din-a6": "222", "din_a6": "222",
+    }
+    _PRINT24_HARDCODED_QUANTITY_MAP: dict[str, str] = {
+        "250": "438",
+        "10": "339",
+    }
+
+    @staticmethod
+    def _print24_value_matches_captured_label(requested: Any, captured_label: str) -> bool:
+        req_text = str(requested or "").strip()
+        cap_text = str(captured_label or "").strip()
+        if not req_text or not cap_text:
+            return False
+        norm_req = re.sub(r"\s+", " ", unicodedata.normalize("NFKD", req_text)).strip().lower()
+        norm_cap = re.sub(r"\s+", " ", unicodedata.normalize("NFKD", cap_text)).strip().lower()
+        if not norm_req:
+            return False
+        if norm_req == norm_cap:
+            return True
+        return norm_req in norm_cap
+
+    def _consume_print24_catalog(
+        self,
+        state: RunState,
+        requested_options: dict[str, Any],
+    ) -> tuple[dict[str, str], list[dict[str, Any]], list[dict[str, Any]]]:
+        desired_ids: dict[str, str] = {}
+        applied: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        prevalidation = dict(state.target.bootstrap_signals.get("option_prevalidation") or {})
+        for row in list(prevalidation.get("matched") or []):
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key") or "")
+            if not key or key not in requested_options:
+                continue
+            co = dict(row.get("catalogOption") or {})
+            box_name = str(co.get("name") or "").strip()
+            bh = dict(co.get("backendHints") or {})
+            prop_id = str(bh.get("dataPropertyId") or "").strip()
+            if not box_name or not prop_id:
+                continue
+            captured_label = str(co.get("visibleLabel") or co.get("visibleValue") or "")
+            requested_value = requested_options.get(key)
+            if self._print24_value_matches_captured_label(requested_value, captured_label):
+                desired_ids[box_name] = prop_id
+                applied.append({"key": key, "boxName": box_name, "propId": prop_id, "capturedLabel": captured_label, "via": "harvested_catalog"})
+            else:
+                skipped.append({
+                    "key": key,
+                    "rawValue": str(requested_value),
+                    "reason": "prop_id_unknown_for_value",
+                    "boxName": box_name,
+                    "capturedValue": captured_label,
+                    "capturedPropId": prop_id,
+                    "note": (
+                        "Print24 catalog harvest only carries the currently-captured option per "
+                        "group. The prop_id for the requested value is unknown. Re-bootstrap with "
+                        "the desired value pre-selected, supply --option-id explicitly, or wait "
+                        "for the `repo` probe (print24_feasibility_notes.md §3.1/§9)."
+                    ),
+                })
+        return desired_ids, applied, skipped
+
     def _build_print24_synthesized_candidate(
         self,
         state: RunState,
@@ -920,29 +1710,57 @@ class ExecutionAgent:
         if not isinstance(payload, dict):
             return None
 
-        desired_ids: dict[str, str] = {}
+        desired_ids, catalog_applied, catalog_skipped = self._consume_print24_catalog(
+            state, effective_options
+        )
+        catalog_applied_keys = {entry["key"] for entry in catalog_applied}
+        catalog_covered = catalog_applied_keys | {
+            entry["key"] for entry in catalog_skipped
+        }
 
-        fmt_value = effective_options.get("format")
-        fmt_norm = str(fmt_value or "").strip().lower()
-        if fmt_norm in {"a5", "din a5", "din-a5", "din_a5"}:
-            desired_ids["format"] = "268"
-        elif fmt_norm in {"a6", "din a6", "din-a6", "din_a6"}:
-            desired_ids["format"] = "222"
+        sideload_applied: list[dict[str, Any]] = []
+        prevalidation = dict(state.target.bootstrap_signals.get("option_prevalidation") or {})
+        for row in list(prevalidation.get("matched") or []):
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key") or "")
+            if not key or key not in effective_options:
+                continue
+            if key in catalog_applied_keys:
+                continue
+            sr = dict(row.get("sideloadResolution") or {})
+            box_name = str(sr.get("propertyId") or "").strip()
+            backend_id = str(sr.get("backendId") or "").strip()
+            if not box_name or not backend_id:
+                continue
+            desired_ids[box_name] = backend_id
+            sideload_applied.append(
+                {
+                    "key": key,
+                    "boxName": box_name,
+                    "propId": backend_id,
+                    "matchedLabel": sr.get("matchedLabel"),
+                    "confidence": sr.get("confidence"),
+                    "productScope": list(sr.get("productScope") or ["*"]),
+                    "via": "sideload",
+                }
+            )
 
-        qty_value = effective_options.get("quantity")
-        qty_int: int | None = None
-        try:
-            qty_int = int(str(qty_value).strip())
-        except Exception:
-            qty_int = None
-
-        if qty_int == 250:
-            desired_ids["quantity"] = "438"
-        elif qty_int == 10:
-            desired_ids["quantity"] = "339"
-
-        if not desired_ids:
-            return None
+        sideload_keys = {entry["key"] for entry in sideload_applied}
+        resolved_keys = catalog_covered | sideload_keys
+        hardcoded_applied: list[dict[str, Any]] = []
+        if "format" not in resolved_keys:
+            fmt_norm = str(effective_options.get("format") or "").strip().lower()
+            mapped = self._PRINT24_HARDCODED_FORMAT_MAP.get(fmt_norm)
+            if mapped:
+                desired_ids["format"] = mapped
+                hardcoded_applied.append({"key": "format", "boxName": "format", "propId": mapped, "via": "hardcoded_fallback"})
+        if "quantity" not in resolved_keys:
+            qty_norm = str(effective_options.get("quantity") or "").strip()
+            mapped = self._PRINT24_HARDCODED_QUANTITY_MAP.get(qty_norm)
+            if mapped:
+                desired_ids["quantity"] = mapped
+                hardcoded_applied.append({"key": "quantity", "boxName": "quantity", "propId": mapped, "via": "hardcoded_fallback"})
 
         updated: list[dict[str, Any]] = []
         updated_any = False
@@ -964,7 +1782,16 @@ class ExecutionAgent:
             updated_any = True
             updated.append({"name": name, "from": current, "to": desired})
 
-        if not updated_any:
+        covered_keys = (
+            catalog_covered | sideload_keys | {entry["key"] for entry in hardcoded_applied}
+        )
+        unsupported_inputs = [
+            {"inputKey": key, "rawValue": str(effective_options.get(key))}
+            for key in effective_options
+            if str(key).strip() and key not in covered_keys
+        ]
+
+        if not updated_any and not catalog_skipped and not unsupported_inputs:
             return None
 
         endpoint = str(template_trace.get("url") or state.target.product_url)
@@ -978,6 +1805,11 @@ class ExecutionAgent:
                 "kind": "print24_property_ids",
                 "propertiesUpdated": updated,
                 "productAliasId": payload.get("product_alias_id"),
+                "unsupportedInputs": unsupported_inputs,
+                "catalogApplied": catalog_applied,
+                "sideloadApplied": sideload_applied,
+                "hardcodedApplied": hardcoded_applied,
+                "skipped": catalog_skipped,
             },
         }
 
@@ -990,74 +1822,85 @@ class ExecutionAgent:
         except Exception:
             return None
 
-    @staticmethod
-    def _find_trace(endpoint: str, traces: list[dict[str, Any]]) -> dict[str, Any] | None:
+    def _find_trace(
+        self,
+        endpoint: str,
+        traces: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         endpoint_text = str(endpoint or "").strip()
+        endpoint_info = DiscoveryAgent._normalize_replay_url(endpoint_text)
         if not endpoint_text:
-            return None
+            return None, DiscoveryAgent._build_trace_match_diagnostics(
+                endpoint=endpoint_text,
+                endpoint_info=endpoint_info,
+                traces=traces,
+                matched_trace=None,
+                match_strategy="missing_endpoint",
+                match_confidence=0.0,
+                mismatch_reason="missing_endpoint",
+            )
 
-        candidates: list[tuple[int, int, dict[str, Any]]] = []
+        candidates: list[tuple[float, int, dict[str, Any], str, list[str]]] = []
         for idx, trace in enumerate(traces):
-            url = str(trace.get("url", "")).strip()
-            if not url:
+            if not str(trace.get("url", "")).strip():
                 continue
-
-            match_kind: str | None = None
-            if url == endpoint_text:
-                match_kind = "exact"
-            elif endpoint_text in url or url.startswith(endpoint_text):
-                match_kind = "partial"
-
-            if match_kind is None:
+            confidence, match_strategy, reasons = DiscoveryAgent._score_trace_match_candidate(endpoint_info, trace)
+            if confidence <= 0.0:
                 continue
+            candidates.append((confidence, idx, trace, match_strategy, reasons))
 
+        if not candidates:
+            diagnostics = DiscoveryAgent._build_trace_match_diagnostics(
+                endpoint=endpoint_text,
+                endpoint_info=endpoint_info,
+                traces=traces,
+                matched_trace=None,
+                match_strategy="no_match",
+                match_confidence=0.0,
+                mismatch_reason="no_semantic_overlap",
+            )
+            return None, diagnostics
+
+        def candidate_priority(row: tuple[float, int, dict[str, Any], str, list[str]]) -> tuple[float, int, int, int, int, int, int]:
+            confidence, idx, trace, _match_strategy, reasons = row
             method = str(trace.get("method", "GET")).upper()
             resource_type = str(trace.get("resource_type", "")).lower()
             status = int(trace.get("status", 0) or 0)
             response_type = str(trace.get("response_content_type", "") or "").lower()
             request_type = str(trace.get("request_content_type", "") or "").lower()
-            has_post_data = bool(trace.get("post_data"))
-            has_preview = bool(str(trace.get("response_body_preview") or "").strip())
-
-            score = 0
-            score += 12 if match_kind == "exact" else 3
+            body_present = 1 if trace.get("post_data") else 0
+            semantic_bonus = 0
+            reason_text = " ".join(reasons).lower()
+            if any(token in reason_text for token in ["pricing_semantics", "quantity_semantics"]):
+                semantic_bonus += 2
+            if "config_semantics" in reason_text:
+                semantic_bonus += 1
             if method == "POST":
-                score += 10
-            elif method == "GET":
-                score += 2
-            else:
-                score -= 4
-
+                semantic_bonus += 3
             if resource_type in {"xhr", "fetch"}:
-                score += 9
-            elif resource_type == "document":
-                score += 1
-            else:
-                score -= 2
-
-            if 200 <= status < 300:
-                score += 4
-            elif status >= 400:
-                score -= 5
-
+                semantic_bonus += 2
             if "json" in response_type:
-                score += 7
+                semantic_bonus += 2
             if "json" in request_type:
-                score += 2
-            if "/api/" in url.lower() or "graphql" in url.lower():
-                score += 2
-            if has_post_data:
-                score += 3
-            if has_preview:
-                score += 1
+                semantic_bonus += 1
+            if 200 <= status < 300:
+                semantic_bonus += 1
+            if body_present:
+                semantic_bonus += 2
+            return (confidence, semantic_bonus, body_present, 1 if method == "POST" else 0, 1 if resource_type in {"xhr", "fetch"} else 0, -status, -idx)
 
-            candidates.append((score, idx, trace))
-
-        if not candidates:
-            return None
-
-        _score, _idx, best = max(candidates, key=lambda row: (row[0], row[1]))
-        return best
+        confidence, idx, best, match_strategy, reasons = max(candidates, key=candidate_priority)
+        diagnostics = DiscoveryAgent._build_trace_match_diagnostics(
+            endpoint=endpoint_text,
+            endpoint_info=endpoint_info,
+            traces=traces,
+            matched_trace=best,
+            match_strategy=match_strategy,
+            match_confidence=confidence,
+            mismatch_reason=None,
+        )
+        diagnostics["matchReasons"] = reasons[:10]
+        return best, diagnostics
 
     @staticmethod
     def _cookie_header(cookies: dict[str, str]) -> str:
@@ -1867,6 +2710,37 @@ class ExecutionAgent:
         return updated
 
     @staticmethod
+    def _apply_interpolation_quantity(
+        pairs: list[tuple[str, str]],
+        *,
+        qty_field_name: str,
+        typed_value: str,
+    ) -> tuple[list[tuple[str, str]], bool, int]:
+        if not qty_field_name or typed_value == "":
+            return list(pairs), False, -1
+        qty_field_index = -1
+        for index, (key, _value) in enumerate(pairs):
+            if key == qty_field_name:
+                qty_field_index = index
+                break
+        if qty_field_index < 0:
+            return list(pairs), False, -1
+        target_qty1_index = -1
+        for index in range(qty_field_index + 1, len(pairs)):
+            if pairs[index][0] == "input_qty_1":
+                target_qty1_index = index
+                break
+        new_pairs = [
+            (key, "Interpolation") if index == qty_field_index else (key, value)
+            for index, (key, value) in enumerate(pairs)
+        ]
+        if target_qty1_index >= 0:
+            new_pairs[target_qty1_index] = ("input_qty_1", str(typed_value))
+        else:
+            new_pairs.insert(qty_field_index + 1, ("input_qty_1", str(typed_value)))
+        return new_pairs, True, qty_field_index
+
+    @staticmethod
     def _onlineprinters_group_code(
         option_row: dict[str, Any],
         group_row: dict[str, Any],
@@ -1996,6 +2870,7 @@ class ExecutionAgent:
 
         endpoint = str(template_trace.get("url") or state.target.product_url)
         updated_fields: list[dict[str, Any]] = []
+        skipped_fields: list[dict[str, Any]] = []
         updated_any = False
         variant_url_applied = ""
 
@@ -2027,10 +2902,6 @@ class ExecutionAgent:
             if match_type == "quantity_manual":
                 control_value = str(requested_value)
 
-            if control_name and control_value:
-                form_pairs = self._replace_form_pair(form_pairs, control_name, control_value)
-                updated_any = True
-
             option_backend = dict(option_row.get("backendHints") or {})
             group_code = self._onlineprinters_group_code(option_row, group_row)
             option_code = str(option_backend.get("dataVarindex") or "").strip()
@@ -2038,7 +2909,64 @@ class ExecutionAgent:
             if variant_url:
                 variant_url_applied = urljoin(state.target.product_url, variant_url)
 
-            if current_setlink and option_code:
+            # Interpolation-mode handling for quantity_manual (per
+            # onlineprinters_request_modification.md §5B). See OnlineprintersSiteAdapter
+            # for the design.
+            interpolation_mode = False
+            interpolation_note = ""
+            if match_type == "quantity_manual" and control_name:
+                tile_signals = dict(matched_row.get("quantityTileSignals") or {})
+                tile_presets = list(tile_signals.get("tilePresets") or [])
+                typed_qty_norm = str(requested_value or "").strip()
+                in_presets = typed_qty_norm in tile_presets
+                supports_interp = bool(tile_signals.get("supportsInterpolation"))
+                interp_code = str(tile_signals.get("interpolationVarindex") or "")
+                max_preset = int(tile_signals.get("maxTilePreset") or 0)
+                if not in_presets and supports_interp and interp_code:
+                    interpolation_mode = True
+                    control_value = "Interpolation"
+                    option_code = interp_code
+                    if max_preset:
+                        try:
+                            requested_int = int(typed_qty_norm)
+                            if requested_int > max_preset:
+                                interpolation_note = (
+                                    f"requested qty {requested_int} > max tile preset {max_preset}; "
+                                    "configurator-specific interpolation upper bound applies"
+                                )
+                        except ValueError:
+                            pass
+                elif in_presets:
+                    tile_var_map = dict(tile_signals.get("tileVarindexByValue") or {})
+                    tile_code = str(tile_var_map.get(typed_qty_norm) or "")
+                    if tile_code:
+                        option_code = tile_code
+
+            option_code_unknown = bool(option_row.get("optionCodeUnknown"))
+            is_currently_selected = bool(option_row.get("selected"))
+            block_write_due_to_unknown_code = (
+                option_code_unknown
+                and not is_currently_selected
+                and match_type != "quantity_manual"
+            )
+
+            row_changed_form = False
+            if interpolation_mode:
+                form_pairs, did_apply, _qty_idx = self._apply_interpolation_quantity(
+                    form_pairs,
+                    qty_field_name=control_name,
+                    typed_value=str(requested_value),
+                )
+                if did_apply:
+                    updated_any = True
+                    row_changed_form = True
+            elif control_name and control_value and not block_write_due_to_unknown_code:
+                form_pairs = self._replace_form_pair(form_pairs, control_name, control_value)
+                updated_any = True
+                row_changed_form = True
+
+            row_changed_setlink = False
+            if current_setlink and option_code and not block_write_due_to_unknown_code:
                 updated_setlink = self._update_onlineprinters_setlink(
                     current_setlink,
                     group_code=group_code,
@@ -2048,18 +2976,49 @@ class ExecutionAgent:
                 if updated_setlink and updated_setlink != current_setlink:
                     current_setlink = updated_setlink
                     updated_any = True
+                    row_changed_setlink = True
 
-            updated_fields.append(
-                {
-                    "key": key,
-                    "requested": requested_value,
-                    "controlName": control_name,
-                    "controlValue": control_value,
-                    "groupCode": group_code,
-                    "optionCode": option_code,
-                    "variantUrl": variant_url_applied or None,
-                }
-            )
+            field_record_entry: dict[str, Any] = {
+                "key": key,
+                "requested": requested_value,
+                "controlName": control_name,
+                "controlValue": control_value,
+                "groupCode": group_code,
+                "optionCode": option_code,
+                "variantUrl": variant_url_applied or None,
+                "quantityMode": ("interpolation" if interpolation_mode else ("tile" if match_type == "quantity_manual" else None)),
+            }
+            if interpolation_note:
+                field_record_entry["interpolationNote"] = interpolation_note
+            updated_fields.append(field_record_entry)
+
+            if block_write_due_to_unknown_code:
+                skipped_fields.append(
+                    {
+                        "key": key,
+                        "requested": requested_value,
+                        "reason": "option_code_unknown_for_value",
+                        "currentlySelectedValue": str(option_row.get("visibleLabel") or option_row.get("visibleValue") or ""),
+                        "controlName": control_name,
+                        "note": "Form field name was learned from the captured POST, but the depvar option code for the requested value is unknown. Bootstrap would need to probe alternative options or scrape variant URLs to learn it.",
+                    }
+                )
+            elif not row_changed_form and not row_changed_setlink:
+                missing: list[str] = []
+                if not control_name:
+                    missing.append("control_name")
+                if not option_code:
+                    missing.append("option_code")
+                if not variant_url and not current_setlink:
+                    missing.append("variant_url_or_setlink")
+                skipped_fields.append(
+                    {
+                        "key": key,
+                        "requested": requested_value,
+                        "reason": "catalog_row_missing_form_metadata",
+                        "missing": missing,
+                    }
+                )
 
         if current_setlink:
             setlink_key = next((key for key, _value in form_pairs if key.lower() == "setlink"), "SetLink")
@@ -2067,6 +3026,13 @@ class ExecutionAgent:
 
         if variant_url_applied:
             endpoint = variant_url_applied
+
+        matched_keys = {str(row.get("key") or "") for row in matched_rows if str(row.get("key") or "")}
+        unsupported_inputs = [
+            {"inputKey": key, "rawValue": str(effective_options.get(key))}
+            for key in effective_options
+            if str(key).strip() and key not in matched_keys
+        ]
 
         if not updated_any:
             return None
@@ -2081,6 +3047,8 @@ class ExecutionAgent:
                 "fieldsUpdated": updated_fields,
                 "setLinkApplied": bool(current_setlink),
                 "variantUrlApplied": variant_url_applied or None,
+                "skipped": skipped_fields,
+                "unsupportedInputs": unsupported_inputs,
             },
         }
 
@@ -2099,13 +3067,32 @@ class ExecutionAgent:
         if state.plan is not None:
             add(state.plan.endpoint, "plan_endpoint")
 
-        for index, row in enumerate(state.observation.endpoint_rankings if state.observation else []):
+        rankings = state.observation.endpoint_rankings if state.observation else []
+
+        for index, row in enumerate(rankings):
             score = int(row.get("score", 0) or 0)
             if score <= 0:
                 continue
             add(str(row.get("url", "")), f"ranked_endpoint_{index}")
             if len(candidates) >= 6:
                 break
+
+        # Endpoint ranking is noisy for multi-call pricing flows: a true pricing
+        # endpoint can score <=0 because infrastructure tokens penalize it or because
+        # a single captured trace doesn't carry strong pricing signals on its own.
+        # The request-family classifier is computed independently of that score, so
+        # we rescue pricing-family endpoints that the score gate would otherwise drop.
+        pricing_families = {"pricing_pipeline", "quantity_pipeline", "schema_pipeline"}
+        for index, row in enumerate(rankings):
+            if len(candidates) >= 6:
+                break
+            score = int(row.get("score", 0) or 0)
+            if score > 0:
+                continue
+            family = str(row.get("request_family") or "")
+            if family not in pricing_families:
+                continue
+            add(str(row.get("url", "")), f"family_rescued_{family}_{index}")
 
         add(state.target.product_url, "target_product_url")
 
@@ -2170,10 +3157,64 @@ class ExecutionAgent:
         effective_options = dict(raw_requested_options)
         effective_options.update(normalized_subset)
 
-        endpoint_candidates: list[dict[str, Any]] = build_site_replay_candidates(
-            state,
-            effective_options=effective_options,
-            raw_requested_options=raw_requested_options,
+        adapter_candidates: list[dict[str, Any]] = []
+        adapter_diagnostics: dict[str, Any] = {
+            "loadedCount": 0,
+            "matchedAdapterId": None,
+            "reason": "disabled",
+            "warnings": [],
+            "siteAdapterDiagnostics": {},
+        }
+        site_adapter_dir = str(state.target.bootstrap_signals.get("site_adapters_dir") or "").strip()
+        allow_generated_site_adapters = bool(
+            state.target.bootstrap_signals.get("allow_generated_site_adapters", False)
+        )
+        generated_site_adapters, site_adapter_diag = load_generated_site_adapters(
+            site_adapter_dir if site_adapter_dir else None,
+            allow_untrusted=allow_generated_site_adapters,
+        )
+        try:
+            json_adapters_dir = str(state.target.bootstrap_signals.get("json_adapters_dir") or "").strip()
+            json_adapters_path = Path(json_adapters_dir) if json_adapters_dir else None
+            json_adapters, load_diag = load_json_adapters_with_diagnostics(adapters_dir=json_adapters_path)
+            matched_adapter, match_diag = match_json_adapter_with_diagnostics(
+                json_adapters,
+                state.target.product_url,
+            )
+            adapter_diagnostics = {
+                "loadedCount": int(load_diag.get("loadedCount", 0) or 0),
+                "matchedAdapterId": match_diag.get("matchedAdapterId"),
+                "reason": str(match_diag.get("reason") or "no_matching_adapter"),
+                "warnings": list(load_diag.get("warnings") or [])[:5],
+                "siteAdapterDiagnostics": site_adapter_diag,
+            }
+            if matched_adapter is not None:
+                adapter_candidate = build_adapter_http_candidate(
+                    matched_adapter,
+                    target_url=state.target.product_url,
+                    effective_options=effective_options,
+                    raw_requested_options=raw_requested_options,
+                )
+                if adapter_candidate is not None:
+                    adapter_candidates.append(adapter_candidate)
+        except Exception:
+            adapter_candidates = []
+            adapter_diagnostics = {
+                "loadedCount": 0,
+                "matchedAdapterId": None,
+                "reason": "adapter_runtime_error",
+                "warnings": [],
+                "siteAdapterDiagnostics": site_adapter_diag,
+            }
+
+        endpoint_candidates: list[dict[str, Any]] = list(adapter_candidates)
+        endpoint_candidates.extend(
+            build_site_replay_candidates(
+                state,
+                effective_options=effective_options,
+                raw_requested_options=raw_requested_options,
+                additional_adapters=generated_site_adapters,
+            )
         )
         endpoint_candidates.extend(self._build_http_replay_candidates(state))
         if not endpoint_candidates:
@@ -2198,7 +3239,21 @@ class ExecutionAgent:
                 and ("/api/" not in endpoint_lower)
                 and ("://api." not in endpoint_lower)
             )
-            trace = candidate.get("trace_override") or self._find_trace(endpoint, state.target.network_traces)
+            trace_override = candidate.get("trace_override")
+            if trace_override is not None:
+                trace = trace_override
+                trace_match_diag = DiscoveryAgent._build_trace_match_diagnostics(
+                    endpoint=endpoint,
+                    endpoint_info=DiscoveryAgent._normalize_replay_url(endpoint),
+                    traces=[trace_override],
+                    matched_trace=trace_override,
+                    match_strategy="trace_override",
+                    match_confidence=1.0,
+                    mismatch_reason=None,
+                )
+                trace_match_diag["matchReasons"] = ["trace_override"]
+            else:
+                trace, trace_match_diag = self._find_trace(endpoint, state.target.network_traces)
             if trace is None:
                 attempts.append(
                     {
@@ -2206,9 +3261,31 @@ class ExecutionAgent:
                         "source": endpoint_source,
                         "result": "skipped",
                         "reason": "no_matching_trace",
+                        **trace_match_diag,
                     }
                 )
                 continue
+
+            # When the candidate URL is a partial/templated version of the matched trace
+            # (path_prefix / path_containment), the candidate URL would hit a stale or
+            # incomplete server path. The matched trace URL is from the current session
+            # and was validated by the browser, so use it for the actual HTTP request.
+            # Exact matches (normalized_exact, normalized_path_exact, trace_override) are
+            # left unchanged because the candidate URL already carries the right path.
+            match_strategy_used = str(trace_match_diag.get("matchStrategy") or "")
+            if match_strategy_used in {"path_prefix", "path_containment"}:
+                matched_trace_url = str(trace.get("url") or "").strip()
+                if matched_trace_url and matched_trace_url != endpoint:
+                    trace_match_diag["originalCandidateEndpoint"] = endpoint
+                    trace_match_diag["endpointSubstituted"] = True
+                    trace_match_diag["substitutionReason"] = match_strategy_used
+                    endpoint = matched_trace_url
+                    endpoint_lower = endpoint.lower()
+                    allow_bootstrap_candidates = (
+                        (not request_only)
+                        and ("/api/" not in endpoint_lower)
+                        and ("://api." not in endpoint_lower)
+                    )
 
             method = str(candidate.get("method") or trace.get("method", "GET")).upper()
             if method not in {"GET", "POST"}:
@@ -2219,6 +3296,7 @@ class ExecutionAgent:
                         "result": "skipped",
                         "reason": "unsupported_method",
                         "method": method,
+                        **trace_match_diag,
                     }
                 )
                 continue
@@ -2320,6 +3398,7 @@ class ExecutionAgent:
                                 "errorType": type(exc).__name__,
                                 "retryIndex": int(retry_index),
                                 "proxy": self._redact_proxy(proxy_url),
+                                **trace_match_diag,
                             }
                         )
                         break
@@ -2347,6 +3426,7 @@ class ExecutionAgent:
                             "retryIndex": int(retry_index),
                             "retryInMs": int(round(backoff_s * 1000.0)),
                             "proxy": self._redact_proxy(proxy_url),
+                            **trace_match_diag,
                         }
                     )
                     if backoff_s > 0:
@@ -2365,6 +3445,7 @@ class ExecutionAgent:
                             "contentType": content_type,
                             "retryIndex": int(retry_index),
                             "proxy": self._redact_proxy(proxy_url),
+                            **trace_match_diag,
                         }
                     )
                 elif retry_reason == "request_error":
@@ -2378,6 +3459,7 @@ class ExecutionAgent:
                             "errorType": retry_error_type,
                             "retryIndex": int(retry_index),
                             "proxy": self._redact_proxy(proxy_url),
+                            **trace_match_diag,
                         }
                     )
                 break
@@ -2409,12 +3491,38 @@ class ExecutionAgent:
             shipping_variants: list[dict[str, Any]] = []
             accepted_configuration = dict(state.target.options)
             normalization_signals: list[str] = []
+            adapter_result: dict[str, Any] | None = None
+
+            adapter_extract = dict(candidate.get("adapter_response_extract") or {})
+            adapter_inputs = dict(candidate.get("adapter_inputs_used") or {})
 
             if payload is not None:
+                if adapter_extract:
+                    adapter_result = extract_adapter_result(
+                        payload,
+                        response_extract=adapter_extract,
+                        inputs_used=adapter_inputs,
+                    )
+                    if adapter_result is not None:
+                        extracted_price = float(adapter_result.get("price"))
+                        extracted_source = str(adapter_result.get("source") or "adapter")
+                        extracted_score = 1000
+                        all_price_candidates.append(
+                            {
+                                "value": extracted_price,
+                                "score": extracted_score,
+                                "source": extracted_source,
+                            }
+                        )
+
                 accepted_configuration, normalization_signals = self._extract_server_accepted_configuration(
                     payload,
                     effective_options,
                 )
+                if adapter_result is not None:
+                    config_summary = adapter_result.get("config_summary")
+                    if isinstance(config_summary, dict) and config_summary:
+                        accepted_configuration = dict(config_summary)
                 candidates = self._extract_weighted_prices_from_payload(payload)
                 all_price_candidates.extend(candidates)
                 best_candidate = self._select_best_price_candidate(candidates, state.target.expected_price)
@@ -2514,6 +3622,7 @@ class ExecutionAgent:
                         "reason": "no_price_extracted",
                         "status": status,
                         "contentType": content_type,
+                        **trace_match_diag,
                     }
                 )
                 continue
@@ -2525,6 +3634,7 @@ class ExecutionAgent:
                     "result": "success",
                     "status": status,
                     "contentType": content_type,
+                    **trace_match_diag,
                 }
             )
             replay_summary = self._summarize_http_replay(
@@ -2538,13 +3648,18 @@ class ExecutionAgent:
                 success=True,
                 accepted_configuration=accepted_configuration,
                 price_value=round(float(extracted_price), 2),
-                currency=state.target.expected_currency,
+                currency=(
+                    str(adapter_result.get("currency") or "").strip()
+                    if adapter_result is not None
+                    else state.target.expected_currency
+                )
+                or state.target.expected_currency,
                 price_matrix=price_matrix,
                 shipping_variants=shipping_variants,
                 raw_response_summary={
                     "strategy": state.plan.strategy.value,
                     "endpoint": endpoint,
-                    "replay": "http",
+                    "replay": "adapter" if adapter_result is not None else "http",
                     "status": status,
                     "contentType": content_type,
                     "responseDump": response_dump,
@@ -2557,6 +3672,8 @@ class ExecutionAgent:
                     "namedPrices": named_prices,
                     "httpReplay": replay_summary,
                     "requestTemplateApplied": dict(candidate.get("request_template_applied") or {}),
+                    "adapterResult": adapter_result,
+                    "adapterDiagnostics": adapter_diagnostics,
                     **candidate_views,
                 },
             ), replay_summary
@@ -3028,8 +4145,8 @@ class ValidationAgent:
         if request_only:
             replay_mode = str(state.extraction.raw_response_summary.get("replay") or "none").lower()
             fallback_mode = str(state.extraction.raw_response_summary.get("fallback") or "none").lower()
-            if replay_mode != "http":
-                mismatches.append(f"request_only_replay_mismatch expected=http actual={replay_mode}")
+            if replay_mode not in {"http", "adapter"}:
+                mismatches.append(f"request_only_replay_mismatch expected=http_or_adapter actual={replay_mode}")
                 if reason == "price_not_extracted":
                     reason = "request_only_http_replay_failed"
                 else:

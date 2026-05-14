@@ -6,6 +6,7 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote_plus
 
 from ..agents import DiscoveryAgent
 from ..knowledge_store import KnowledgeStore
@@ -25,6 +26,7 @@ class OnboardingProposal:
     blockers: list[str]
     replay_templates: list[dict[str, object]]
     option_normalizations: dict[str, dict[str, str]]
+    trace_template_hints: list[dict[str, Any]]
     suggested_next_steps: list[str]
     adapter_stub: str
 
@@ -120,6 +122,205 @@ def _render_adapter_stub(site_name: str) -> str:
     )
 
 
+def _safe_json_loads(value: Any) -> dict[str, Any] | list[Any] | None:
+    if not isinstance(value, str):
+        return None
+    text = str(value).strip()
+    if not text or text[0] not in "[{":
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    if isinstance(parsed, (dict, list)):
+        return parsed
+    return None
+
+
+def _collect_json_paths(payload: Any, *, max_paths: int = 80) -> list[str]:
+    paths: list[str] = []
+
+    def walk(value: Any, prefix: str) -> None:
+        if len(paths) >= max_paths:
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_text = str(key).strip()
+                if not key_text:
+                    continue
+                next_path = f"{prefix}.{key_text}" if prefix else key_text
+                paths.append(next_path)
+                walk(child, next_path)
+                if len(paths) >= max_paths:
+                    return
+            return
+        if isinstance(value, list):
+            for index, child in enumerate(value[:3]):
+                next_path = f"{prefix}[{index}]" if prefix else f"[{index}]"
+                paths.append(next_path)
+                walk(child, next_path)
+                if len(paths) >= max_paths:
+                    return
+
+    walk(payload, "")
+    return paths[:max_paths]
+
+
+def _extract_form_keys(form_body: str, *, max_keys: int = 24) -> list[str]:
+    body = str(form_body or "")
+    if not body:
+        return []
+
+    keys: list[str] = []
+    for part in body.split("&"):
+        if "=" not in part:
+            continue
+        key = unquote_plus(part.split("=", 1)[0]).strip()
+        if not key or key in keys:
+            continue
+        keys.append(key)
+        if len(keys) >= max_keys:
+            break
+    return keys
+
+
+OPTION_KEY_ALIASES: dict[str, tuple[str, ...]] = {
+    "quantity": ("quantity", "qty", "auflage", "menge", "stueck", "stuck", "print_runs", "printruns"),
+    "format": ("format", "size", "groesse", "grosse", "dimension"),
+    "material": ("material", "papier", "paper"),
+    "pages": ("pages", "seiten", "seite"),
+    "color": ("color", "colour", "farben", "farbe", "farbig", "farbigkeit"),
+    "binding": ("binding", "bindung", "verarbeitung"),
+    "finishing": ("finishing", "finish", "veredelung"),
+    "orientation": ("orientation", "ausrichtung", "aspect_ratio", "aspectratio"),
+}
+
+
+def _canonical_option_key(token: str) -> str | None:
+    lowered = str(token or "").strip().lower()
+    if not lowered:
+        return None
+    for canonical, aliases in OPTION_KEY_ALIASES.items():
+        for alias in aliases:
+            if alias in lowered:
+                return canonical
+    return None
+
+
+def _infer_option_key_from_path(path: str) -> str | None:
+    return _canonical_option_key(path)
+
+
+def _build_trace_template_hints(
+    top_endpoints: list[dict[str, Any]],
+    traces: list[dict[str, Any]],
+    *,
+    max_hints: int = 4,
+) -> list[dict[str, Any]]:
+    trace_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in traces:
+        if not isinstance(row, dict):
+            continue
+        method = str(row.get("method") or "").strip().upper()
+        url = str(row.get("url") or "").strip()
+        if not method or not url:
+            continue
+        trace_by_key.setdefault((method, url), row)
+
+    hints: list[dict[str, Any]] = []
+    for endpoint in list(top_endpoints or [])[: max(1, int(max_hints))]:
+        if not isinstance(endpoint, dict):
+            continue
+
+        method = str(endpoint.get("method") or "").strip().upper()
+        url = str(endpoint.get("url") or "").strip()
+        if not method or not url:
+            continue
+
+        trace = trace_by_key.get((method, url), {})
+        if not isinstance(trace, dict) or not trace:
+            continue
+
+        body_text = str(trace.get("post_data") or trace.get("post_data_preview") or "")
+        json_payload = _safe_json_loads(body_text)
+
+        body_kind = "raw"
+        request_keys_sample: list[str] = []
+        candidate_mutations: list[dict[str, str]] = []
+
+        if isinstance(json_payload, (dict, list)):
+            body_kind = "json"
+            json_paths = _collect_json_paths(json_payload, max_paths=90)
+            request_keys_sample = json_paths[:24]
+
+            seen_paths: set[str] = set()
+            for path in json_paths:
+                option_key = _infer_option_key_from_path(path)
+                if not option_key or path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                candidate_mutations.append(
+                    {
+                        "option_key": option_key,
+                        "path": path,
+                        "reason": "path_token_match",
+                    }
+                )
+
+            if isinstance(json_payload, dict):
+                properties = json_payload.get("properties")
+                if isinstance(properties, list):
+                    canonical_seen: set[str] = set()
+                    for row in properties:
+                        if not isinstance(row, dict):
+                            continue
+                        name = str(row.get("name") or "").strip()
+                        if not name:
+                            continue
+                        canonical = _canonical_option_key(name)
+                        if canonical is None or canonical in canonical_seen:
+                            continue
+                        semantic_path = f"properties[name={name}].id"
+                        if semantic_path in seen_paths:
+                            continue
+                        seen_paths.add(semantic_path)
+                        canonical_seen.add(canonical)
+                        candidate_mutations.append(
+                            {
+                                "option_key": canonical,
+                                "path": semantic_path,
+                                "reason": "properties_name_id_pattern",
+                            }
+                        )
+        elif "=" in body_text and "&" in body_text:
+            body_kind = "form"
+            form_keys = _extract_form_keys(body_text, max_keys=24)
+            request_keys_sample = form_keys
+            for key in form_keys:
+                option_key = _infer_option_key_from_path(key)
+                if not option_key:
+                    continue
+                candidate_mutations.append(
+                    {
+                        "option_key": option_key,
+                        "path": key,
+                        "reason": "form_key_match",
+                    }
+                )
+
+        hints.append(
+            {
+                "endpoint_url": url,
+                "method": method,
+                "body_kind": body_kind,
+                "request_keys_sample": request_keys_sample,
+                "candidate_mutations": candidate_mutations[:16],
+            }
+        )
+
+    return hints
+
+
 def build_onboarding_proposal(
     *,
     run_dir: str,
@@ -175,6 +376,12 @@ def build_onboarding_proposal(
             }
         )
 
+    trace_template_hints = _build_trace_template_hints(
+        top_endpoints,
+        [row for row in traces if isinstance(row, dict)],
+        max_hints=4,
+    )
+
     store = KnowledgeStore(knowledge_db)
     try:
         replay_templates = store.get_site_replay_templates(site_name)
@@ -211,6 +418,10 @@ def build_onboarding_proposal(
     suggested_next_steps.append(
         "Implement a new SiteAdapter that synthesizes replay candidates for this site/product type."
     )
+    if trace_template_hints:
+        suggested_next_steps.append(
+            "Use trace_template_hints.candidate_mutations to drive deterministic payload rewrite logic before adding fallback heuristics."
+        )
     suggested_next_steps.append(
         "Add an offline regression fixture from this run directory (network_traces + option_catalog + templates)."
     )
@@ -229,6 +440,7 @@ def build_onboarding_proposal(
         blockers=list(obs.blockers or []),
         replay_templates=replay_templates,
         option_normalizations=option_normalizations,
+        trace_template_hints=trace_template_hints,
         suggested_next_steps=suggested_next_steps,
         adapter_stub=adapter_stub,
     )

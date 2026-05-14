@@ -5,7 +5,10 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Any, Protocol
+import importlib.util
+from pathlib import Path
+from types import ModuleType
+from typing import Any, ClassVar, Protocol
 from urllib.parse import parse_qsl, quote, unquote, urljoin, urlencode, urlsplit, urlunsplit
 
 from .models import RunState
@@ -14,6 +17,81 @@ from .models import RunState
 class SiteAdapter(Protocol):
     def supports(self, state: RunState) -> bool:
         ...
+
+
+def _looks_like_site_adapter(value: Any) -> bool:
+    if not isinstance(value, type):
+        return False
+    supports = getattr(value, "supports", None)
+    build_candidates = getattr(value, "build_http_replay_candidates", None)
+    return callable(supports) and callable(build_candidates)
+
+
+def load_generated_site_adapters(
+    adapters_dir: str | Path | None,
+    *,
+    allow_untrusted: bool,
+) -> tuple[list[SiteAdapter], dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "loadedCount": 0,
+        "fileCount": 0,
+        "reason": "disabled",
+        "warnings": [],
+        "errors": [],
+    }
+    if not allow_untrusted:
+        return [], diagnostics
+
+    if adapters_dir is None:
+        diagnostics["reason"] = "missing_dir"
+        return [], diagnostics
+
+    path = Path(adapters_dir)
+    if not path.exists() or not path.is_dir():
+        diagnostics["reason"] = "missing_dir"
+        return [], diagnostics
+
+    adapters: list[SiteAdapter] = []
+    diagnostics["reason"] = "ok"
+    files = sorted(path.glob("*.py"))
+    diagnostics["fileCount"] = len(files)
+
+    for index, file_path in enumerate(files):
+        module_name = f"generated_site_adapter_{index}"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, file_path)
+            if spec is None or spec.loader is None:
+                diagnostics["warnings"].append({"file": str(file_path), "kind": "load_failed"})
+                continue
+            module = importlib.util.module_from_spec(spec)
+            loader = spec.loader
+            if isinstance(module, ModuleType):
+                loader.exec_module(module)
+            else:
+                diagnostics["warnings"].append({"file": str(file_path), "kind": "invalid_module"})
+                continue
+        except Exception as exc:
+            diagnostics["warnings"].append({"file": str(file_path), "kind": "import_error", "error": str(exc)})
+            continue
+
+        discovered = 0
+        for name in dir(module):
+            value = getattr(module, name, None)
+            if not _looks_like_site_adapter(value):
+                continue
+            try:
+                adapters.append(value())
+                discovered += 1
+            except Exception as exc:
+                diagnostics["warnings"].append(
+                    {"file": str(file_path), "kind": "init_error", "class": str(name), "error": str(exc)}
+                )
+
+        if discovered == 0:
+            diagnostics["warnings"].append({"file": str(file_path), "kind": "no_adapter_found"})
+
+    diagnostics["loadedCount"] = len(adapters)
+    return adapters, diagnostics
 
     def build_http_replay_candidates(
         self,
@@ -285,6 +363,44 @@ class SaxoprintSiteAdapter:
             if prop_id > 0 and value_id > 0:
                 overrides[prop_id] = value_id
         return overrides
+
+    @staticmethod
+    def _extract_sideload_overrides(state: RunState) -> list[dict[str, Any]]:
+        """Read prevalidation `matched[*].sideloadResolution` rows produced by
+        `cli._augment_with_sideload` and return one candidate record per
+        resolved row. Each record carries `propertyId` / `backendId` (both
+        coerced to int) plus diagnostics for the rollup. Caller decides
+        precedence against explicit / label overrides.
+        """
+        records: list[dict[str, Any]] = []
+        prevalidation = dict(state.target.bootstrap_signals.get("option_prevalidation") or {})
+        for row in list(prevalidation.get("matched") or []):
+            if not isinstance(row, dict):
+                continue
+            sr = dict(row.get("sideloadResolution") or {})
+            if not sr:
+                continue
+            try:
+                prop_id = int(str(sr.get("propertyId") or "").strip())
+                backend_id = int(str(sr.get("backendId") or "").strip())
+            except (ValueError, TypeError):
+                continue
+            if prop_id <= 0 or backend_id <= 0:
+                continue
+            records.append(
+                {
+                    "key": str(row.get("key") or ""),
+                    "propertyId": prop_id,
+                    "backendId": backend_id,
+                    "matchedLabel": sr.get("matchedLabel"),
+                    "confidence": sr.get("confidence"),
+                    "productScope": list(sr.get("productScope") or ["*"]),
+                    "sourceLabel": sr.get("sourceLabel"),
+                    "canonicalKey": str(row.get("key") or ""),
+                    "via": "sideload",
+                }
+            )
+        return records
 
     @staticmethod
     def _extract_property_label_overrides(raw_requested_options: dict[str, Any]) -> dict[int, str]:
@@ -824,6 +940,34 @@ class SaxoprintSiteAdapter:
                     }
                 )
 
+        # SIDELOAD: from value_maps/saxoprint.de.json (loaded into
+        # option_prevalidation.matched[*].sideloadResolution by
+        # cli._augment_with_sideload). Wins over the dropdown-trigger
+        # heuristic; loses to explicit property_*=N and label-resolved
+        # property_*="..." (both already in property_overrides above).
+        sideload_candidates = self._extract_sideload_overrides(state)
+        sideload_applied: list[dict[str, Any]] = []
+        for record in sideload_candidates:
+            pid = int(record["propertyId"])
+            if pid in property_overrides:
+                # Explicit or label-resolved already won.
+                continue
+            value_id = int(record["backendId"])
+            property_overrides[pid] = value_id
+            sideload_applied.append(record)
+            updates.append(
+                {
+                    "propertyId": pid,
+                    "from": None,
+                    "to": value_id,
+                    "source": "saxoprint_sideload",
+                    "key": record["key"],
+                    "matchedLabel": record["matchedLabel"],
+                    "confidence": record["confidence"],
+                    "productScope": record["productScope"],
+                }
+            )
+
         # Resolve friendly option keys (e.g. format/bindung/material) if they appear as dropdown triggers.
         # This is best-effort; manual property_* overrides always win.
         synthesis_issues: list[dict[str, Any]] = []
@@ -1007,6 +1151,7 @@ class SaxoprintSiteAdapter:
                     "requestedFriendlyOptions": requested_friendly[:50],
                     "appliedFriendlyOptions": applied_friendly[:50],
                     "synthesisIssues": synthesis_issues[:50],
+                    "sideloadApplied": sideload_applied[:50],
                 },
             }
         ]
@@ -1048,6 +1193,116 @@ class Print24SiteAdapter:
             return None
         return max(candidates, key=lambda row: row[0])[1]
 
+    # Hardcoded fallback mapping per option_key — used when the bootstrap's
+    # productDetails harvest didn't run (older runs / runs without traces).
+    # These remain correct for the values they cover; broader coverage now
+    # comes from the harvested catalog. See `_consume_print24_catalog`.
+    _HARDCODED_FORMAT_MAP: ClassVar[dict[str, str]] = {
+        "a5": "268", "din a5": "268", "din-a5": "268", "din_a5": "268",
+        "a6": "222", "din a6": "222", "din-a6": "222", "din_a6": "222",
+    }
+    _HARDCODED_QUANTITY_MAP: ClassVar[dict[str, str]] = {
+        "250": "438",
+        "10": "339",
+    }
+
+    @staticmethod
+    def _value_matches_captured_label(requested: Any, captured_label: str) -> bool:
+        """Return True iff the user's requested value is the SAME option as the
+        captured visibleLabel of the prevalidation-matched catalog row.
+
+        Print24's prevalidation matches groups loosely (alias-based scoring),
+        so a `material` request for "115 g/m² Bilderdruckpapier" will "match"
+        the captured row for "130 g/m² Recycling-Bilderdruckpapier" — same
+        group, different option. Using the captured prop_id in that case
+        would write the WRONG option to the server and return the wrong
+        price silently.
+
+        Strict check: after normalizing whitespace and lowercasing, require
+        the request to be either equal to the captured label or a substring
+        of it. Numeric-overlap heuristics (e.g., "A5" vs "A6" share no
+        numbers; "DIN A5" vs "105 x 148 mm DIN A6" share "148") have proven
+        unreliable — substring is the cleanest signal that the user typed
+        the captured label (in full or in part).
+        """
+        req_text = str(requested or "").strip()
+        cap_text = str(captured_label or "").strip()
+        if not req_text or not cap_text:
+            return False
+        # NFKD decomposes Unicode superscripts (²/³) into their digit
+        # equivalents and splits precomposed accents, so users who type
+        # `g/m2` match captured `g/m²` and `stück` matches `Stück`.
+        norm_req = re.sub(r"\s+", " ", unicodedata.normalize("NFKD", req_text)).strip().lower()
+        norm_cap = re.sub(r"\s+", " ", unicodedata.normalize("NFKD", cap_text)).strip().lower()
+        if not norm_req:
+            return False
+        if norm_req == norm_cap:
+            return True
+        return norm_req in norm_cap
+
+    @staticmethod
+    def _consume_print24_catalog(
+        state: RunState,
+        raw_requested_options: dict[str, Any],
+    ) -> tuple[dict[str, str], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Pull desired property prop_ids from the productDetails-harvested
+        catalog (`option_prevalidation.matched`). Returns (desired_ids,
+        catalog_applied, catalog_skipped) where desired_ids maps box_name
+        to prop_id ONLY for options whose user-requested value actually
+        matches the captured label. Mismatches are recorded in
+        catalog_skipped with reason=prop_id_unknown_for_value.
+        """
+        desired_ids: dict[str, str] = {}
+        applied: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+
+        prevalidation = dict(state.target.bootstrap_signals.get("option_prevalidation") or {})
+        matched_rows = list(prevalidation.get("matched") or [])
+        for row in matched_rows:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key") or "")
+            if not key or key not in raw_requested_options:
+                continue
+            catalog_option = dict(row.get("catalogOption") or {})
+            box_name = str(catalog_option.get("name") or "").strip()
+            backend_hints = dict(catalog_option.get("backendHints") or {})
+            prop_id = str(backend_hints.get("dataPropertyId") or "").strip()
+            if not box_name or not prop_id:
+                continue
+            captured_label = str(catalog_option.get("visibleLabel") or catalog_option.get("visibleValue") or "")
+            requested_value = raw_requested_options.get(key)
+            if Print24SiteAdapter._value_matches_captured_label(requested_value, captured_label):
+                desired_ids[box_name] = prop_id
+                applied.append(
+                    {
+                        "key": key,
+                        "boxName": box_name,
+                        "propId": prop_id,
+                        "capturedLabel": captured_label,
+                        "via": "harvested_catalog",
+                    }
+                )
+            else:
+                skipped.append(
+                    {
+                        "key": key,
+                        "rawValue": str(requested_value),
+                        "reason": "prop_id_unknown_for_value",
+                        "boxName": box_name,
+                        "capturedValue": captured_label,
+                        "capturedPropId": prop_id,
+                        "note": (
+                            "Print24 catalog harvest only carries the currently-captured option per "
+                            "group (one prop_id from `productDetails.prop_details`). The prop_id for "
+                            "the requested value is unknown. Re-bootstrap with the desired value "
+                            "pre-selected, supply --option-id explicitly, or wait for the `repo` "
+                            "probe (print24_feasibility_notes.md §3.1/§9) that harvests all alternatives."
+                        ),
+                    }
+                )
+        return desired_ids, applied, skipped
+
     def build_http_replay_candidates(
         self,
         state: RunState,
@@ -1070,29 +1325,66 @@ class Print24SiteAdapter:
         if not isinstance(payload, dict):
             return []
 
-        desired_ids: dict[str, str] = {}
+        # PRIMARY: harvested productDetails catalog (per print24_feasibility_notes.md §3.3).
+        desired_ids, catalog_applied, catalog_skipped = self._consume_print24_catalog(
+            state, raw_requested_options
+        )
+        catalog_applied_keys = {entry["key"] for entry in catalog_applied}
+        catalog_covered_keys = catalog_applied_keys | {
+            entry["key"] for entry in catalog_skipped
+        }
 
-        fmt_value = raw_requested_options.get("format")
-        fmt_norm = str(fmt_value or "").strip().lower()
-        if fmt_norm in {"a5", "din a5", "din-a5", "din_a5"}:
-            desired_ids["format"] = "268"
-        elif fmt_norm in {"a6", "din a6", "din-a6", "din_a6"}:
-            desired_ids["format"] = "222"
+        # SECONDARY: sideloaded value-map (`value_maps/print24.com.json`).
+        # Fills slots that the harvested catalog couldn't resolve cleanly. Does
+        # NOT override catalog_applied (catalog is freshest, per-session). Does
+        # override catalog_skipped (catalog matched the group but couldn't
+        # resolve the requested value — sideload may know the prop_id).
+        sideload_applied: list[dict[str, Any]] = []
+        prevalidation = dict(state.target.bootstrap_signals.get("option_prevalidation") or {})
+        for row in list(prevalidation.get("matched") or []):
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key") or "")
+            if not key or key not in raw_requested_options:
+                continue
+            if key in catalog_applied_keys:
+                continue
+            sr = dict(row.get("sideloadResolution") or {})
+            box_name = str(sr.get("propertyId") or "").strip()
+            backend_id = str(sr.get("backendId") or "").strip()
+            if not box_name or not backend_id:
+                continue
+            desired_ids[box_name] = backend_id
+            sideload_applied.append(
+                {
+                    "key": key,
+                    "boxName": box_name,
+                    "propId": backend_id,
+                    "matchedLabel": sr.get("matchedLabel"),
+                    "confidence": sr.get("confidence"),
+                    "productScope": list(sr.get("productScope") or ["*"]),
+                    "via": "sideload",
+                }
+            )
 
-        qty_value = raw_requested_options.get("quantity")
-        qty_int: int | None = None
-        try:
-            qty_int = int(str(qty_value).strip())
-        except Exception:
-            qty_int = None
-
-        if qty_int == 250:
-            desired_ids["quantity"] = "438"
-        elif qty_int == 10:
-            desired_ids["quantity"] = "339"
-
-        if not desired_ids:
-            return []
+        # LEGACY FALLBACK: hardcoded A5/A6 + 250/10 mappings for keys the
+        # catalog harvest AND sideload couldn't cover (preserves behavior for
+        # older runs without value_maps/print24.com.json).
+        sideload_keys = {entry["key"] for entry in sideload_applied}
+        resolved_keys = catalog_covered_keys | sideload_keys
+        hardcoded_applied: list[dict[str, Any]] = []
+        if "format" not in resolved_keys:
+            fmt_norm = str(raw_requested_options.get("format") or "").strip().lower()
+            mapped_format = self._HARDCODED_FORMAT_MAP.get(fmt_norm)
+            if mapped_format:
+                desired_ids["format"] = mapped_format
+                hardcoded_applied.append({"key": "format", "boxName": "format", "propId": mapped_format, "via": "hardcoded_fallback"})
+        if "quantity" not in resolved_keys:
+            qty_norm = str(raw_requested_options.get("quantity") or "").strip()
+            mapped_qty = self._HARDCODED_QUANTITY_MAP.get(qty_norm)
+            if mapped_qty:
+                desired_ids["quantity"] = mapped_qty
+                hardcoded_applied.append({"key": "quantity", "boxName": "quantity", "propId": mapped_qty, "via": "hardcoded_fallback"})
 
         updated: list[dict[str, Any]] = []
         updated_any = False
@@ -1114,7 +1406,23 @@ class Print24SiteAdapter:
             updated_any = True
             updated.append({"name": name, "from": current, "to": desired})
 
-        if not updated_any:
+        # Compute unsupportedInputs across ALL requested keys not covered by
+        # catalog (applied OR skipped), sideload, or the hardcoded fallback.
+        covered_keys = (
+            catalog_covered_keys
+            | sideload_keys
+            | {entry["key"] for entry in hardcoded_applied}
+        )
+        unsupported_inputs = [
+            {"inputKey": key, "rawValue": str(raw_requested_options.get(key))}
+            for key in raw_requested_options
+            if str(key).strip() and key not in covered_keys
+        ]
+
+        # Emit a candidate even if no payload row changed, so diagnostics
+        # surface when every requested option fell into catalog_skipped /
+        # unsupported_inputs (user must see why nothing was applied).
+        if not updated_any and not catalog_skipped and not unsupported_inputs:
             return []
 
         endpoint = str(template_trace.get("url") or state.target.product_url)
@@ -1129,6 +1437,11 @@ class Print24SiteAdapter:
                     "kind": "print24_property_ids",
                     "propertiesUpdated": updated,
                     "productAliasId": payload.get("product_alias_id"),
+                    "unsupportedInputs": unsupported_inputs,
+                    "catalogApplied": catalog_applied,
+                    "sideloadApplied": sideload_applied,
+                    "hardcodedApplied": hardcoded_applied,
+                    "skipped": catalog_skipped,
                 },
             }
         ]
@@ -1166,6 +1479,50 @@ class OnlineprintersSiteAdapter:
         if not replaced:
             updated.append((key, str(value)))
         return updated
+
+    @staticmethod
+    def _apply_interpolation_quantity(
+        pairs: list[tuple[str, str]],
+        *,
+        qty_field_name: str,
+        typed_value: str,
+    ) -> tuple[list[tuple[str, str]], bool, int]:
+        """Per onlineprinters_request_modification.md §5B: write the literal
+        string "Interpolation" into the quantity tile field AND write the
+        typed quantity into the input_qty_1 field that immediately follows
+        the qty field in form-pair order. Preserve everything else in place;
+        do NOT delete/append, that breaks the request.
+
+        Returns (new_pairs, did_write, qty_field_index)."""
+        if not qty_field_name or typed_value == "":
+            return list(pairs), False, -1
+
+        qty_field_index = -1
+        for index, (key, _value) in enumerate(pairs):
+            if key == qty_field_name:
+                qty_field_index = index
+                break
+        if qty_field_index < 0:
+            return list(pairs), False, -1
+
+        target_qty1_index = -1
+        for index in range(qty_field_index + 1, len(pairs)):
+            if pairs[index][0] == "input_qty_1":
+                target_qty1_index = index
+                break
+
+        new_pairs = [
+            (key, "Interpolation") if index == qty_field_index else (key, value)
+            for index, (key, value) in enumerate(pairs)
+        ]
+        if target_qty1_index >= 0:
+            new_pairs[target_qty1_index] = ("input_qty_1", str(typed_value))
+        else:
+            # No trailing input_qty_1 exists; insert one immediately after the
+            # qty field rather than appending at the end (the configurator is
+            # sensitive to placement per the MD).
+            new_pairs.insert(qty_field_index + 1, ("input_qty_1", str(typed_value)))
+        return new_pairs, True, qty_field_index
 
     @staticmethod
     def _onlineprinters_group_code(option_row: dict[str, Any], group_row: dict[str, Any]) -> str:
@@ -1299,6 +1656,7 @@ class OnlineprintersSiteAdapter:
 
         endpoint = str(template_trace.get("url") or state.target.product_url)
         updated_fields: list[dict[str, Any]] = []
+        skipped_fields: list[dict[str, Any]] = []
         updated_any = False
         variant_url_applied = ""
 
@@ -1325,10 +1683,6 @@ class OnlineprintersSiteAdapter:
             if match_type == "quantity_manual":
                 control_value = str(requested_value)
 
-            if control_name and control_value:
-                form_pairs = self._replace_form_pair(form_pairs, control_name, control_value)
-                updated_any = True
-
             option_backend = dict(option_row.get("backendHints") or {})
             group_code = self._onlineprinters_group_code(option_row, group_row)
             option_code = str(option_backend.get("dataVarindex") or "").strip()
@@ -1336,7 +1690,75 @@ class OnlineprintersSiteAdapter:
             if variant_url:
                 variant_url_applied = urljoin(state.target.product_url, variant_url)
 
-            if current_setlink and option_code:
+            # Onlineprinters interpolation mode (per onlineprinters_request_modification.md
+            # §5B): when the requested quantity is not in the captured tile presets,
+            # the configurator expects input_var_<PROD>_<qty_group>_1 = "Interpolation"
+            # plus the typed quantity carried in input_qty_1 (positionally after the
+            # qty input_var). The Interpolation tile's data-varindex from the DOM
+            # is the setlink option_code for this mode.
+            interpolation_mode = False
+            interpolation_note = ""
+            if match_type == "quantity_manual" and control_name:
+                tile_signals = dict(matched_row.get("quantityTileSignals") or {})
+                tile_presets = list(tile_signals.get("tilePresets") or [])
+                typed_qty_norm = str(requested_value or "").strip()
+                in_presets = typed_qty_norm in tile_presets
+                supports_interp = bool(tile_signals.get("supportsInterpolation"))
+                interp_code = str(tile_signals.get("interpolationVarindex") or "")
+                max_preset = int(tile_signals.get("maxTilePreset") or 0)
+                if not in_presets and supports_interp and interp_code:
+                    interpolation_mode = True
+                    control_value = "Interpolation"
+                    option_code = interp_code
+                    if max_preset:
+                        # Best-effort note when requested qty exceeds even the
+                        # max preset — interpolation usually has a server-side
+                        # upper bound; if the response normalizes, this is why.
+                        try:
+                            requested_int = int(typed_qty_norm)
+                            if requested_int > max_preset:
+                                interpolation_note = (
+                                    f"requested qty {requested_int} > max tile preset {max_preset}; "
+                                    "configurator-specific interpolation upper bound applies"
+                                )
+                        except ValueError:
+                            pass
+                elif in_presets:
+                    tile_var_map = dict(tile_signals.get("tileVarindexByValue") or {})
+                    tile_code = str(tile_var_map.get(typed_qty_norm) or "")
+                    if tile_code:
+                        option_code = tile_code
+
+            # If the catalog row carries `optionCodeUnknown` AND it is NOT the
+            # currently-selected option, writing only the visible label would
+            # let the backend silently normalize back to the current selection
+            # (per onlineprinters_request_modification.md §3.3). Skip with a
+            # precise reason so the user sees what's needed (a probed mapping).
+            option_code_unknown = bool(option_row.get("optionCodeUnknown"))
+            is_currently_selected = bool(option_row.get("selected"))
+            block_write_due_to_unknown_code = (
+                option_code_unknown
+                and not is_currently_selected
+                and match_type != "quantity_manual"
+            )
+
+            row_changed_form = False
+            if interpolation_mode:
+                form_pairs, did_apply, _qty_idx = self._apply_interpolation_quantity(
+                    form_pairs,
+                    qty_field_name=control_name,
+                    typed_value=str(requested_value),
+                )
+                if did_apply:
+                    updated_any = True
+                    row_changed_form = True
+            elif control_name and control_value and not block_write_due_to_unknown_code:
+                form_pairs = self._replace_form_pair(form_pairs, control_name, control_value)
+                updated_any = True
+                row_changed_form = True
+
+            row_changed_setlink = False
+            if current_setlink and option_code and not block_write_due_to_unknown_code:
                 updated_setlink = self._update_onlineprinters_setlink(
                     current_setlink,
                     group_code=group_code,
@@ -1346,18 +1768,49 @@ class OnlineprintersSiteAdapter:
                 if updated_setlink and updated_setlink != current_setlink:
                     current_setlink = updated_setlink
                     updated_any = True
+                    row_changed_setlink = True
 
-            updated_fields.append(
-                {
-                    "key": key,
-                    "requested": requested_value,
-                    "controlName": control_name,
-                    "controlValue": control_value,
-                    "groupCode": group_code,
-                    "optionCode": option_code,
-                    "variantUrl": variant_url_applied or None,
-                }
-            )
+            field_record = {
+                "key": key,
+                "requested": requested_value,
+                "controlName": control_name,
+                "controlValue": control_value,
+                "groupCode": group_code,
+                "optionCode": option_code,
+                "variantUrl": variant_url_applied or None,
+                "quantityMode": ("interpolation" if interpolation_mode else ("tile" if match_type == "quantity_manual" else None)),
+            }
+            if interpolation_note:
+                field_record["interpolationNote"] = interpolation_note
+            updated_fields.append(field_record)
+
+            if block_write_due_to_unknown_code:
+                skipped_fields.append(
+                    {
+                        "key": key,
+                        "requested": requested_value,
+                        "reason": "option_code_unknown_for_value",
+                        "currentlySelectedValue": str(option_row.get("visibleLabel") or option_row.get("visibleValue") or ""),
+                        "controlName": control_name,
+                        "note": "Form field name was learned from the captured POST, but the depvar option code for the requested value is unknown. Bootstrap would need to probe alternative options or scrape variant URLs to learn it.",
+                    }
+                )
+            elif not row_changed_form and not row_changed_setlink:
+                missing: list[str] = []
+                if not control_name:
+                    missing.append("control_name")
+                if not option_code:
+                    missing.append("option_code")
+                if not variant_url and not current_setlink:
+                    missing.append("variant_url_or_setlink")
+                skipped_fields.append(
+                    {
+                        "key": key,
+                        "requested": requested_value,
+                        "reason": "catalog_row_missing_form_metadata",
+                        "missing": missing,
+                    }
+                )
 
         if current_setlink:
             setlink_key = next((key for key, _value in form_pairs if key.lower() == "setlink"), "SetLink")
@@ -1365,6 +1818,13 @@ class OnlineprintersSiteAdapter:
 
         if variant_url_applied:
             endpoint = variant_url_applied
+
+        matched_keys = {str(row.get("key") or "") for row in matched_rows if str(row.get("key") or "")}
+        unsupported_inputs = [
+            {"inputKey": key, "rawValue": str(raw_requested_options.get(key))}
+            for key in raw_requested_options
+            if str(key).strip() and key not in matched_keys
+        ]
 
         if not updated_any:
             return []
@@ -1380,6 +1840,8 @@ class OnlineprintersSiteAdapter:
                     "fieldsUpdated": updated_fields,
                     "setLinkApplied": bool(current_setlink),
                     "variantUrlApplied": variant_url_applied or None,
+                    "skipped": skipped_fields,
+                    "unsupportedInputs": unsupported_inputs,
                 },
             }
         ]
@@ -1506,9 +1968,13 @@ def build_site_replay_candidates(
     *,
     effective_options: dict[str, Any],
     raw_requested_options: dict[str, Any],
+    additional_adapters: list[SiteAdapter] | None = None,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
-    for adapter in get_default_site_adapters():
+    adapters = list(get_default_site_adapters())
+    if additional_adapters:
+        adapters.extend(additional_adapters)
+    for adapter in adapters:
         if adapter.supports(state):
             candidates.extend(
                 adapter.build_http_replay_candidates(

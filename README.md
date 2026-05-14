@@ -2,6 +2,23 @@
 
 This repository contains an MVP framework for dynamic price extraction feasibility and execution.
 
+## Quick Setup
+
+### Using conda (recommended):
+```bash
+conda env create -f environment.yml
+conda activate price-extractor
+playwright install chromium
+```
+
+### Using pip:
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed setup options.
+
 ## What is implemented
 
 - Feasibility-first pipeline

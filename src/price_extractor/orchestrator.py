@@ -334,6 +334,7 @@ def summarize_run(state: RunState) -> dict:
         "option_unmatched": option_unmatched,
         "replay_mode": response_summary.get("replay", "none"),
         "fallback_mode": response_summary.get("fallback", "none"),
+        "adapter_result": response_summary.get("adapterResult"),
         "http_replay": response_summary.get("httpReplay", {}),
         "extraction_reason": response_summary.get("reason"),
         "named_prices": response_summary.get("namedPrices", {}),

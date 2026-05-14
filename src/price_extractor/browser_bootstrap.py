@@ -7,6 +7,11 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from .option_aliases import build_option_value_aliases
+from .browser_readiness import (
+  attempt_cookie_consent,
+  trigger_configurator_via_semantic_labels,
+  wait_for_configurator_readiness,
+)
 from .request_templates import (
   extract_option_catalog_and_templates,
   set_dropdown_maps,
@@ -91,156 +96,6 @@ def bootstrap_product_url(
       context = browser.new_context()
       page = context.new_page()
 
-      def _count_configurator_api_requests() -> int:
-        hits = 0
-        for url in request_urls:
-          lowered = url.lower()
-          if ("/api/" not in lowered) and ("://api." not in lowered):
-            continue
-          if any(token in lowered for token in ("itemmaster", "shopping-cart", "calculation", "product")):
-            hits += 1
-        return hits
-
-      def _wait_for_configurator_readiness() -> dict[str, Any]:
-        max_wait_ms = max(2000, min(12000, timeout_ms // 2))
-        waited_ms = 0
-        poll_ms = 350
-        reason = "timeout"
-        interactive_count = 0
-
-        while waited_ms <= max_wait_ms:
-          api_hits = _count_configurator_api_requests()
-          try:
-            interactive_count = int(
-              page.evaluate(
-                r"""
-                () => {
-                  const selectors = [
-                  'input[type="radio"]',
-                  'input[type="checkbox"]',
-                  'select',
-                  '[role="option"]',
-                  '[data-option-id]',
-                  '[data-property-id]',
-                  ];
-                  const count = selectors
-                  .map((s) => document.querySelectorAll(s).length)
-                  .reduce((a, b) => a + b, 0);
-                  return Number.isFinite(count) ? count : 0;
-                }
-                """
-              )
-            )
-          except Exception:
-            interactive_count = 0
-
-          if interactive_count >= 2:
-            reason = "interactive_controls"
-            break
-          if api_hits >= 2:
-            reason = "pricing_api_activity"
-            break
-
-          try:
-            page.wait_for_timeout(poll_ms)
-          except Exception:
-            break
-          waited_ms += poll_ms
-
-        return {
-          "waitedMs": waited_ms,
-          "reason": reason,
-          "interactiveCount": interactive_count,
-          "apiHits": _count_configurator_api_requests(),
-        }
-
-      def _attempt_cookie_consent() -> dict[str, Any]:
-        state: dict[str, Any] = {
-          "attempted": False,
-          "bannerDetected": False,
-          "clicked": False,
-          "matchedSelector": None,
-          "matchedText": None,
-          "frameUrl": None,
-        }
-        if not auto_accept_cookies:
-          return state
-
-        state["attempted"] = True
-        selector_candidates = [
-          "button#onetrust-accept-btn-handler",
-          "button[aria-label*='accept' i]",
-          "button[title*='accept' i]",
-          "button[data-testid*='accept' i]",
-          "button[class*='accept' i]",
-          "button[id*='accept' i]",
-          "[role='button'][aria-label*='accept' i]",
-          "button[aria-label*='zustimm' i]",
-          "button[title*='zustimm' i]",
-          "button[class*='zustimm' i]",
-          "button[id*='zustimm' i]",
-        ]
-        text_patterns = [
-          "accept all",
-          "accept",
-          "allow all",
-          "agree",
-          "i agree",
-          "alle akzeptieren",
-          "akzeptieren",
-          "zustimmen",
-          "einverstanden",
-          "alle zulassen",
-        ]
-
-        frames = list(page.frames)
-        for frame in frames:
-          for selector in selector_candidates:
-            try:
-              handle = frame.query_selector(selector)
-              if handle is None:
-                continue
-              state["bannerDetected"] = True
-              if handle.is_visible():
-                handle.click(timeout=1000)
-                state["clicked"] = True
-                state["matchedSelector"] = selector
-                state["frameUrl"] = frame.url
-                return state
-            except Exception:
-              continue
-
-          try:
-            elements = frame.query_selector_all("button, [role='button'], input[type='button'], input[type='submit'], a")
-          except Exception:
-            elements = []
-
-          for el in elements[:300]:
-            try:
-              text = (el.inner_text() or "").strip().lower()
-            except Exception:
-              text = ""
-            if not text:
-              try:
-                text = str(el.get_attribute("value") or "").strip().lower()
-              except Exception:
-                text = ""
-            if not text:
-              continue
-
-            if any(pattern in text for pattern in text_patterns):
-              state["bannerDetected"] = True
-              try:
-                el.click(timeout=1000)
-                state["clicked"] = True
-                state["matchedText"] = text[:120]
-                state["frameUrl"] = frame.url
-                return state
-              except Exception:
-                continue
-
-        return state
-
       def on_request(req) -> None:
           if len(request_urls) >= max_observed_requests:
               return
@@ -290,6 +145,8 @@ def bootstrap_product_url(
             post_data_captured = post_data[:post_data_limit]
             post_data_preview = post_data[:500]
           response_body_preview = None
+          response_body_len: int | None = None
+          response_body_preview_truncated: bool | None = None
 
           should_capture_preview = (
             req.resource_type in {"fetch", "xhr"}
@@ -304,9 +161,27 @@ def bootstrap_product_url(
                 url_lower = req.url.lower()
                 if "get-product-values" in url_lower:
                   preview_limit = 80000
+                # Same-site POST responses are usually configurator AJAX (WEBSALE,
+                # Print24 repo/price-matrix, Saxoprint get-product-prices) and ship
+                # all the option-tile HTML / option metadata we need to scrape for
+                # form-field inference. Lift the cap so non-current variants in
+                # large catalogs don't get truncated away.
+                try:
+                  is_same_site_post = (
+                    req.method == "POST"
+                    and infer_site_name(req.url) == result.site_name
+                  )
+                except Exception:
+                  is_same_site_post = False
+                if is_same_site_post:
+                  preview_limit = max(preview_limit, 1_048_576)
+                response_body_len = len(body_text)
+                response_body_preview_truncated = response_body_len > preview_limit
                 response_body_preview = body_text[:preview_limit]
             except Exception:
               response_body_preview = None
+              response_body_len = None
+              response_body_preview_truncated = None
 
           request_headers = {
               k: req_headers[k]
@@ -342,6 +217,8 @@ def bootstrap_product_url(
                 "post_data_len": post_data_len,
                 "post_data_truncated": post_data_truncated,
                   "response_body_preview": response_body_preview,
+                  "response_body_len": response_body_len,
+                  "response_body_preview_truncated": response_body_preview_truncated,
               }
           )
 
@@ -361,7 +238,7 @@ def bootstrap_product_url(
           result.warnings.append(f"Navigation error: {exc}")
 
       try:
-        result.consent_state = _attempt_cookie_consent()
+        result.consent_state = attempt_cookie_consent(page=page, auto_accept_cookies=auto_accept_cookies)
         if result.consent_state.get("clicked"):
           page.wait_for_timeout(500)
         try:
@@ -371,9 +248,48 @@ def bootstrap_product_url(
       except Exception as exc:
         result.warnings.append(f"Consent handling error: {exc}")
 
+      readiness: dict[str, Any] = {}
+      consent_already_clicked = bool(result.consent_state.get("clicked"))
+      consent_retry_log: list[dict[str, Any]] = []
+
+      def _retry_consent(p: Any) -> None:
+        nonlocal consent_already_clicked
+        if consent_already_clicked or not auto_accept_cookies:
+          return
+        try:
+          retry_state = attempt_cookie_consent(page=p, auto_accept_cookies=auto_accept_cookies)
+        except Exception as exc:
+          consent_retry_log.append({"clicked": False, "error": str(exc)[:200]})
+          return
+        consent_retry_log.append({
+          "clicked": bool(retry_state.get("clicked")),
+          "bannerDetected": bool(retry_state.get("bannerDetected")),
+          "matchedSelector": retry_state.get("matchedSelector"),
+          "matchedText": retry_state.get("matchedText"),
+        })
+        if retry_state.get("clicked"):
+          consent_already_clicked = True
+          # Merge the successful late click into the canonical consent state so the
+          # CLI/JSON output reflects what actually happened, not the failed first try.
+          result.consent_state.update({
+            "clicked": True,
+            "bannerDetected": True,
+            "matchedSelector": retry_state.get("matchedSelector"),
+            "matchedText": retry_state.get("matchedText"),
+            "frameUrl": retry_state.get("frameUrl"),
+            "deferred": True,
+          })
+
       try:
-        readiness = _wait_for_configurator_readiness()
+        readiness = wait_for_configurator_readiness(
+          page=page,
+          request_urls=request_urls,
+          timeout_ms=timeout_ms,
+          consent_retry_callback=_retry_consent,
+        )
         result.consent_state["readiness"] = readiness
+        if consent_retry_log:
+          result.consent_state["retryAttempts"] = consent_retry_log
         if (
           readiness.get("reason") == "timeout"
           and int(readiness.get("interactiveCount") or 0) == 0
@@ -384,6 +300,28 @@ def bootstrap_product_url(
           )
       except Exception as exc:
         result.warnings.append(f"Readiness wait error: {exc}")
+
+      # Semantic-label probe: when readiness found no interactive controls and no
+      # pricing API activity (typical for ARIA/React configurators that don't render
+      # native form controls), try to localize configurator option groups by visible
+      # label text and click one option per group. This often triggers the pricing
+      # request pipeline that subsequent capture and replay depend on.
+      try:
+        if (
+          int(readiness.get("interactiveCount") or 0) < 2
+          and int(readiness.get("apiHits") or 0) < 2
+        ):
+          label_probe = trigger_configurator_via_semantic_labels(
+            page=page,
+            request_urls=request_urls,
+          )
+          result.consent_state["labelProbe"] = label_probe
+          try:
+            page.wait_for_load_state("networkidle", timeout=min(3500, timeout_ms))
+          except Exception:
+            pass
+      except Exception as exc:
+        result.warnings.append(f"Label probe error: {exc}")
 
       content = ""
       try:
@@ -796,7 +734,7 @@ def bootstrap_product_url(
                 };
 
                 const map = new Map();
-                const controls = document.querySelectorAll('input[type="radio"], input[type="checkbox"], select, button[aria-pressed], [role="option"], [data-option-id], [data-property-id], a[data-option-id], a[data-property-id], a[href*="depvar_index_setparent"], a[href*="otpmoreformats"], a[class*="format" i]');
+                const controls = document.querySelectorAll('input[type="radio"], input[type="checkbox"], select, button[aria-pressed], [role="option"], [role="radio"], [role="checkbox"], [role="tab"], [data-option-id], [data-property-id], [data-testid*="option" i], [data-cy*="option" i], a[data-option-id], a[data-property-id], a[href*="depvar_index_setparent"], a[href*="otpmoreformats"], a[class*="format" i]');
                 controls.forEach((el) => {
                   const group = findGroupLabel(el);
                   if (!map.has(group)) {
@@ -851,7 +789,7 @@ def bootstrap_product_url(
                   depMap.get(key).signals.add(signal);
                 };
 
-                const allControls = document.querySelectorAll('input, select, button, [role="option"], [data-option-id], [data-property-id], a[data-option-id], a[data-property-id], a[href*="depvar_index_setparent"], a[href*="otpmoreformats"], a[class*="format" i]');
+                const allControls = document.querySelectorAll('input, select, button, [role="option"], [role="radio"], [role="checkbox"], [role="tab"], [data-option-id], [data-property-id], [data-testid*="option" i], [data-cy*="option" i], a[data-option-id], a[data-property-id], a[href*="depvar_index_setparent"], a[href*="otpmoreformats"], a[class*="format" i]');
                 allControls.forEach((el) => {
                   const sourceGroup = findGroupLabel(el);
                   dependencyAttrs.forEach((attr) => {
@@ -875,8 +813,13 @@ def bootstrap_product_url(
                   'input[type="checkbox"]',
                   'select',
                   '[role="option"]',
+                  '[role="radio"]',
+                  '[role="checkbox"]',
+                  '[role="tab"]',
                   '[data-option-id]',
                   '[data-property-id]',
+                  '[data-testid*="option" i]',
+                  '[data-cy*="option" i]',
                   'button[aria-pressed]',
                   'a[data-option-id]',
                   'a[data-property-id]',

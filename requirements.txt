@@ -1,0 +1,16 @@
+# Core dependencies (minimal)
+# Most functionality uses Python stdlib
+
+# Browser automation (--recon-only, bootstrap mode)
+playwright>=1.52.0
+
+# Optional: Agentic onboarding and LangGraph integration
+# Uncomment these if you want to use adapter generation or LangGraph workflows
+# langgraph>=0.2.0
+# langchain-core>=0.3.0
+
+# Development/testing (optional)
+# pytest>=7.0
+# pytest-cov>=4.0
+# black>=23.0
+# ruff>=0.1.0

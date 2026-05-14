@@ -24,6 +24,18 @@ def build_gemini_onboarding_payload(
     llm_api_key_env: str = DEFAULT_GEMINI_KEY_ENV,
     llm_timeout_seconds: float = 60.0,
     dotenv_path: str | None = ".env",
+    llm_critics_enable: bool = False,
+    llm_critics_max: int = 10,
+    llm_critics_delay_seconds: float = 0.0,
+    llm_critics_retry_attempts: int = 0,
+    llm_critics_retry_wait_seconds: float = 30.0,
+    llm_critics_retry_backoff_multiplier: float = 1.25,
+    llm_critics_context_mode: str = "full",
+    llm_critics_context_max_chars: int = 8000,
+    llm_critics_verbose_logs: bool = True,
+    llm_critics_error_severity: str = "warn",
+    deterministic_gate_run_checks: bool = False,
+    deterministic_gate_check_timeout_seconds: float = 180.0,
 ) -> dict[str, Any]:
     """Gemini-focused wrapper around LangGraph onboarding payload generation.
 
@@ -40,7 +52,19 @@ def build_gemini_onboarding_payload(
         llm_base_url=str(llm_base_url or DEFAULT_GEMINI_BASE_URL),
         llm_api_key_env=str(llm_api_key_env or DEFAULT_GEMINI_KEY_ENV),
         llm_timeout_seconds=max(float(llm_timeout_seconds or 60.0), 1.0),
+        llm_critics_enable=bool(llm_critics_enable),
+        llm_critics_max=max(int(llm_critics_max or 10), 1),
+        llm_critics_delay_seconds=max(float(llm_critics_delay_seconds or 0.0), 0.0),
+        llm_critics_retry_attempts=max(int(llm_critics_retry_attempts or 0), 0),
+        llm_critics_retry_wait_seconds=max(float(llm_critics_retry_wait_seconds or 0.0), 0.0),
+        llm_critics_retry_backoff_multiplier=max(float(llm_critics_retry_backoff_multiplier or 1.0), 1.0),
+        llm_critics_context_mode=str(llm_critics_context_mode or "full").strip().lower(),
+        llm_critics_context_max_chars=max(int(llm_critics_context_max_chars or 8000), 1000),
+        llm_critics_verbose_logs=bool(llm_critics_verbose_logs),
+        llm_critics_error_severity=str(llm_critics_error_severity or "warn").strip().lower(),
         dotenv_path=str(dotenv_path or ".env"),
+        deterministic_gate_run_checks=bool(deterministic_gate_run_checks),
+        deterministic_gate_check_timeout_seconds=max(float(deterministic_gate_check_timeout_seconds or 180.0), 1.0),
     )
 
     # Include wrapper metadata so outputs clearly show the Gemini intent.
@@ -103,6 +127,64 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="LLM request timeout in seconds",
     )
     parser.add_argument(
+        "--llm-critics-enable",
+        action="store_true",
+        help="Run dedicated per-critic LLM prompts for recipe and patch critique stages.",
+    )
+    parser.add_argument(
+        "--llm-critics-max",
+        type=int,
+        default=10,
+        help="Maximum number of critic prompts to execute per stage.",
+    )
+    parser.add_argument(
+        "--llm-critics-delay-seconds",
+        type=float,
+        default=0.0,
+        help="Delay between per-critic LLM calls in seconds.",
+    )
+    parser.add_argument(
+        "--llm-critics-retry-attempts",
+        type=int,
+        default=0,
+        help="Number of retry attempts per critic call after initial failure.",
+    )
+    parser.add_argument(
+        "--llm-critics-retry-wait-seconds",
+        type=float,
+        default=30.0,
+        help="Base wait time before retrying a failed critic call.",
+    )
+    parser.add_argument(
+        "--llm-critics-retry-backoff-multiplier",
+        type=float,
+        default=1.25,
+        help="Backoff multiplier applied to each subsequent retry wait.",
+    )
+    parser.add_argument(
+        "--llm-critics-context-mode",
+        choices=["full", "compact"],
+        default="full",
+        help="Context payload mode passed to each LLM critic prompt.",
+    )
+    parser.add_argument(
+        "--llm-critics-context-max-chars",
+        type=int,
+        default=8000,
+        help="Maximum serialized context characters when using compact critic context mode.",
+    )
+    parser.add_argument(
+        "--llm-critics-quiet",
+        action="store_true",
+        help="Disable per-critic progress logs in terminal (stderr).",
+    )
+    parser.add_argument(
+        "--llm-critics-error-severity",
+        choices=["ignore", "warn", "fail"],
+        default="warn",
+        help="How promotion decision should treat LLM critic output-schema errors.",
+    )
+    parser.add_argument(
         "--dotenv-path",
         default=".env",
         help="Optional dotenv path to preload API keys before reading env vars",
@@ -114,6 +196,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--patch-plan-out",
         help="Optional path to write patch-plan JSON artifact",
+    )
+    parser.add_argument(
+        "--deterministic-gate-run-checks",
+        action="store_true",
+        help="Execute deterministic gate runtime commands (unit tests) and include results in payload.",
+    )
+    parser.add_argument(
+        "--deterministic-gate-check-timeout-seconds",
+        type=float,
+        default=180.0,
+        help="Timeout per deterministic-gate runtime command in seconds.",
     )
     return parser.parse_args(argv)
 
@@ -129,7 +222,19 @@ def main(argv: list[str] | None = None) -> None:
         llm_base_url=str(args.llm_base_url),
         llm_api_key_env=str(args.llm_api_key_env),
         llm_timeout_seconds=float(args.llm_timeout_seconds),
+        llm_critics_enable=bool(args.llm_critics_enable),
+        llm_critics_max=max(int(args.llm_critics_max), 1),
+        llm_critics_delay_seconds=max(float(args.llm_critics_delay_seconds), 0.0),
+        llm_critics_retry_attempts=max(int(args.llm_critics_retry_attempts), 0),
+        llm_critics_retry_wait_seconds=max(float(args.llm_critics_retry_wait_seconds), 0.0),
+        llm_critics_retry_backoff_multiplier=max(float(args.llm_critics_retry_backoff_multiplier), 1.0),
+        llm_critics_context_mode=str(args.llm_critics_context_mode),
+        llm_critics_context_max_chars=max(int(args.llm_critics_context_max_chars), 1000),
+        llm_critics_verbose_logs=not bool(args.llm_critics_quiet),
+        llm_critics_error_severity=str(args.llm_critics_error_severity),
         dotenv_path=str(args.dotenv_path) if args.dotenv_path else None,
+        deterministic_gate_run_checks=bool(args.deterministic_gate_run_checks),
+        deterministic_gate_check_timeout_seconds=float(args.deterministic_gate_check_timeout_seconds),
     )
 
     rendered = json.dumps(payload, indent=2, ensure_ascii=True)

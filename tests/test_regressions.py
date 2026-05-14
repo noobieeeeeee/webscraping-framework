@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 from urllib import error
 
@@ -580,6 +581,141 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(summary["drift_report"]["compared"])
         self.assertEqual(summary["drift_verdict"], "material_change")
 
+    def _recon_cache_hit_target(self) -> TargetInput:
+        return TargetInput(
+            site_name="saxoprint.de",
+            product_url="https://www.saxoprint.de/broschueren/broschueren-drucken",
+            product_type="unknown",
+            bootstrap_signals={
+                "recon_cache": {"hit": True},
+                "option_prevalidation": {"available": True, "valid": True, "matched": [], "unmatched": []},
+                "drift_report": {},
+            },
+        )
+
+    def _ok_summary(self) -> dict[str, Any]:
+        return {
+            "site": "saxoprint.de",
+            "url": "https://www.saxoprint.de/broschueren/broschueren-drucken",
+            "validated": True,
+            "feasible": True,
+            "strategy": "hybrid",
+            "price": 123.45,
+            "currency": "EUR",
+            "mismatches": [],
+            "failures": [],
+            "http_replay": {"attempts": [{"result": "success"}]},
+            "replay_mode": "http",
+            "fallback_mode": "none",
+            "extraction_reason": None,
+        }
+
+    def test_empty_request_templates_does_not_trigger_refresh_in_request_only(self) -> None:
+        """A cached bootstrap with `request_templates: {}` (key present, empty)
+        means the bootstrap ran and the site genuinely has no SetLink-style
+        templates (Saxoprint, Print24). Refreshing won't change anything —
+        it just causes per-run re-bootstrap churn and risks producing
+        thinner traces. Only an *absent* key should trigger refresh."""
+        args = make_args(url="https://www.saxoprint.de/broschueren/broschueren-drucken", request_only=True)
+        spec = {"url": args.url}
+
+        bootstrap_cached = {
+            "recon_cache": {"hit": True},
+            "option_catalog": [],          # present, empty — Saxoprint's DOM walker can't see Next.js widgets
+            "request_templates": {},       # present, empty — Saxoprint has no SetLink-style templates
+            "quantity_signal": {},
+            "option_groups": [],
+            "option_dependencies": [],
+            "dependency_probe": {},
+            "network_traces": [],
+        }
+
+        fake_orchestrator = SimpleNamespace(store=object(), run=lambda state: state)
+
+        with mock.patch(
+            "price_extractor.cli.build_target_input",
+            side_effect=[(self._recon_cache_hit_target(), bootstrap_cached)],
+        ) as build_mock:
+            with mock.patch("price_extractor.cli.summarize_run", return_value=self._ok_summary()):
+                summary, _final_state, _bootstrap = cli.run_single_target(fake_orchestrator, args, spec)
+
+        # No refresh — build_target_input called exactly once (the initial cache hit).
+        self.assertEqual(build_mock.call_count, 1)
+        self.assertNotIn("recon_refresh_reason", summary)
+
+    def test_absent_request_templates_key_triggers_missing_enriched_recon(self) -> None:
+        """A cached bootstrap that pre-dates the request_templates feature
+        (the key is absent entirely, not just empty) should still trigger
+        a one-time refresh so the new structured signals get populated."""
+        args = make_args(url="https://www.saxoprint.de/broschueren/broschueren-drucken", request_only=True)
+        spec = {"url": args.url}
+
+        bootstrap_cached_legacy = {
+            "recon_cache": {"hit": True},
+            "option_catalog": [],
+            # request_templates intentionally absent — legacy snapshot.
+            "quantity_signal": {},
+            "option_groups": [],
+            "option_dependencies": [],
+            "dependency_probe": {},
+            "network_traces": [],
+        }
+        bootstrap_refreshed = {
+            "recon_cache": {"hit": False, "refreshed": True},
+            "option_catalog": [],
+            "request_templates": {},  # bootstrap ran, found nothing — fine
+            "quantity_signal": {},
+            "option_groups": [],
+            "option_dependencies": [],
+            "dependency_probe": {},
+            "network_traces": [],
+        }
+
+        fake_orchestrator = SimpleNamespace(store=object(), run=lambda state: state)
+
+        with mock.patch(
+            "price_extractor.cli.build_target_input",
+            side_effect=[
+                (self._recon_cache_hit_target(), bootstrap_cached_legacy),
+                (self._recon_cache_hit_target(), bootstrap_refreshed),
+            ],
+        ) as build_mock:
+            with mock.patch("price_extractor.cli.summarize_run", return_value=self._ok_summary()):
+                summary, _final_state, _bootstrap = cli.run_single_target(fake_orchestrator, args, spec)
+
+        self.assertEqual(build_mock.call_count, 2)
+        self.assertEqual(summary.get("recon_refresh_reason"), "missing_enriched_recon")
+
+    def test_empty_option_catalog_in_request_only_does_not_trigger_refresh(self) -> None:
+        """Pre-existing special case (preserved): in request-only mode, an
+        empty option_catalog is expected (no UI probing) and must not
+        trigger a refresh. This locks in the asymmetry that was already
+        in place before the request_templates fix."""
+        args = make_args(url="https://www.saxoprint.de/broschueren/broschueren-drucken", request_only=True)
+        spec = {"url": args.url}
+
+        bootstrap_cached = {
+            "recon_cache": {"hit": True},
+            "option_catalog": [],          # empty but key present
+            "request_templates": {"currentSetLink": {"value": "x"}},  # non-empty
+            "quantity_signal": {},
+            "option_groups": [],
+            "option_dependencies": [],
+            "dependency_probe": {},
+            "network_traces": [],
+        }
+
+        fake_orchestrator = SimpleNamespace(store=object(), run=lambda state: state)
+
+        with mock.patch(
+            "price_extractor.cli.build_target_input",
+            side_effect=[(self._recon_cache_hit_target(), bootstrap_cached)],
+        ) as build_mock:
+            with mock.patch("price_extractor.cli.summarize_run", return_value=self._ok_summary()):
+                _summary, _final_state, _bootstrap = cli.run_single_target(fake_orchestrator, args, spec)
+
+        self.assertEqual(build_mock.call_count, 1)
+
     def test_print24_replay_injects_portal_header(self) -> None:
         trace = {
             "url": "https://print24.com/api/de/itemmaster/calculation/productDetails/",
@@ -623,6 +759,574 @@ class RegressionTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(seen_headers.get("portal"), "print24")
         self.assertEqual(replay_summary["selectedVia"], "plan_endpoint")
+
+    def test_replay_substitutes_trace_url_for_path_prefix_match(self) -> None:
+        # Planned endpoint is a template (no product id); trace has the instantiated URL.
+        # Fuzzy path_prefix match should find the trace, and the HTTP request should be
+        # sent to the trace URL (current-session, valid path) rather than the candidate URL.
+        trace_url = "https://api.example.com/api/productDetails/12345"
+        trace = {
+            "url": trace_url,
+            "method": "POST",
+            "resource_type": "xhr",
+            "status": 200,
+            "request_headers": {"accept": "application/json", "content-type": "application/json"},
+            "response_content_type": "application/json",
+            "post_data": "{}",
+        }
+        target = TargetInput(
+            site_name="example.com",
+            product_url="https://example.com/some-product",
+            product_type="brochure",
+            network_traces=[trace],
+            bootstrap_signals={
+                "cookies": {},
+                "request_only": True,
+                "learned_normalization_rules": {},
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint="https://api.example.com/api/productDetails/",
+            payload_template={},
+            confidence=0.8,
+            notes="",
+        )
+        agent = ExecutionAgent()
+        seen_urls: list[str] = []
+
+        def fake_urlopen(req, timeout=15):
+            seen_urls.append(req.full_url)
+            return FakeHttpResponse(
+                json.dumps({"total_gross_value": 42.42}),
+                content_type="application/json",
+            )
+
+        with mock.patch("price_extractor.agents.request.urlopen", side_effect=fake_urlopen):
+            result, replay_summary = agent._try_http_replay(state)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(seen_urls, "urlopen should have been called at least once")
+        self.assertEqual(seen_urls[0], trace_url)
+
+        attempts = list(replay_summary.get("attempts") or [])
+        success_attempts = [a for a in attempts if a.get("result") == "success"]
+        self.assertTrue(success_attempts, "expected at least one successful attempt")
+        success = success_attempts[0]
+        self.assertEqual(success.get("endpoint"), trace_url)
+        self.assertTrue(success.get("endpointSubstituted"))
+        self.assertEqual(success.get("substitutionReason"), "path_prefix")
+        self.assertEqual(
+            success.get("originalCandidateEndpoint"),
+            "https://api.example.com/api/productDetails/",
+        )
+
+    def test_build_http_replay_candidates_rescues_zero_score_pricing_family(self) -> None:
+        # A true pricing endpoint can score <=0 when ranking is noisy. The family
+        # classifier is independent, so pricing/quantity/schema families should be
+        # rescued; infrastructure/unknown should not be.
+        target = TargetInput(
+            site_name="example.com",
+            product_url="https://example.com/product",
+            product_type="brochure",
+            network_traces=[],
+            bootstrap_signals={"cookies": {}, "request_only": True},
+        )
+        observation = ObservationBundle(
+            has_script_heavy_ui=False,
+            has_api_calls=True,
+            requires_session=False,
+            endpoint_rankings=[
+                {
+                    "url": "https://api.example.com/api/productDetails/abc",
+                    "score": 0,
+                    "request_family": "pricing_pipeline",
+                },
+                {
+                    "url": "https://api.example.com/api/repo/options",
+                    "score": -2,
+                    "request_family": "schema_pipeline",
+                },
+                {
+                    "url": "https://api.example.com/api/translations",
+                    "score": 0,
+                    "request_family": "infrastructure",
+                },
+                {
+                    "url": "https://cdn.example.com/static/junk.js",
+                    "score": -5,
+                    "request_family": "unknown",
+                },
+            ],
+        )
+        state = RunState(target=target, observation=observation)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint=None,
+            payload_template={},
+            confidence=0.6,
+            notes="",
+        )
+
+        candidates = ExecutionAgent._build_http_replay_candidates(state)
+        candidate_urls = [c["url"] for c in candidates]
+        candidate_sources = {c["url"]: c["source"] for c in candidates}
+
+        self.assertIn("https://api.example.com/api/productDetails/abc", candidate_urls)
+        self.assertIn("https://api.example.com/api/repo/options", candidate_urls)
+        self.assertNotIn("https://api.example.com/api/translations", candidate_urls)
+        self.assertNotIn("https://cdn.example.com/static/junk.js", candidate_urls)
+
+        self.assertTrue(
+            candidate_sources["https://api.example.com/api/productDetails/abc"].startswith("family_rescued_pricing_pipeline_"),
+            f"expected family_rescued source, got {candidate_sources['https://api.example.com/api/productDetails/abc']}",
+        )
+        self.assertTrue(
+            candidate_sources["https://api.example.com/api/repo/options"].startswith("family_rescued_schema_pipeline_"),
+        )
+
+    def test_build_http_replay_candidates_preserves_positive_score_priority(self) -> None:
+        # Positive-score endpoints should still be added first (preserving existing behavior).
+        target = TargetInput(
+            site_name="example.com",
+            product_url="https://example.com/product",
+            product_type="brochure",
+            network_traces=[],
+            bootstrap_signals={"cookies": {}, "request_only": True},
+        )
+        observation = ObservationBundle(
+            has_script_heavy_ui=False,
+            has_api_calls=True,
+            requires_session=False,
+            endpoint_rankings=[
+                {
+                    "url": "https://api.example.com/api/price",
+                    "score": 10,
+                    "request_family": "pricing_pipeline",
+                },
+                {
+                    "url": "https://api.example.com/api/productDetails/xyz",
+                    "score": 0,
+                    "request_family": "pricing_pipeline",
+                },
+            ],
+        )
+        state = RunState(target=target, observation=observation)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint=None,
+            payload_template={},
+            confidence=0.6,
+            notes="",
+        )
+
+        candidates = ExecutionAgent._build_http_replay_candidates(state)
+        ranked_idx = next(i for i, c in enumerate(candidates) if c["url"] == "https://api.example.com/api/price")
+        rescued_idx = next(i for i, c in enumerate(candidates) if c["url"] == "https://api.example.com/api/productDetails/xyz")
+        self.assertLess(ranked_idx, rescued_idx)
+        self.assertEqual(candidates[ranked_idx]["source"], "ranked_endpoint_0")
+        self.assertTrue(candidates[rescued_idx]["source"].startswith("family_rescued_"))
+
+    def test_replay_does_not_substitute_on_exact_match(self) -> None:
+        # When the candidate URL matches the trace URL exactly (normalized_exact),
+        # no substitution should happen and the request should go to the candidate URL.
+        trace_url = "https://api.example.com/api/productDetails/12345"
+        trace = {
+            "url": trace_url,
+            "method": "POST",
+            "resource_type": "xhr",
+            "status": 200,
+            "request_headers": {"accept": "application/json", "content-type": "application/json"},
+            "response_content_type": "application/json",
+            "post_data": "{}",
+        }
+        target = TargetInput(
+            site_name="example.com",
+            product_url="https://example.com/some-product",
+            product_type="brochure",
+            network_traces=[trace],
+            bootstrap_signals={
+                "cookies": {},
+                "request_only": True,
+                "learned_normalization_rules": {},
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint=trace_url,
+            payload_template={},
+            confidence=0.8,
+            notes="",
+        )
+        agent = ExecutionAgent()
+        seen_urls: list[str] = []
+
+        def fake_urlopen(req, timeout=15):
+            seen_urls.append(req.full_url)
+            return FakeHttpResponse(
+                json.dumps({"total_gross_value": 42.42}),
+                content_type="application/json",
+            )
+
+        with mock.patch("price_extractor.agents.request.urlopen", side_effect=fake_urlopen):
+            result, replay_summary = agent._try_http_replay(state)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(seen_urls[0], trace_url)
+        attempts = list(replay_summary.get("attempts") or [])
+        success_attempts = [a for a in attempts if a.get("result") == "success"]
+        self.assertTrue(success_attempts)
+        success = success_attempts[0]
+        self.assertFalse(success.get("endpointSubstituted", False))
+        self.assertNotIn("originalCandidateEndpoint", success)
+
+    def test_json_adapter_executes_saxoprint_end_to_end(self) -> None:
+        target = TargetInput(
+            site_name="saxoprint.de",
+            product_url="https://www.saxoprint.de/broschueren/broschueren-drucken",
+            product_type="brochure",
+            expected_currency="EUR",
+            options={"quantity": 600},
+            network_traces=[],
+            bootstrap_signals={
+                "cookies": {},
+                "request_only": True,
+                "learned_normalization_rules": {},
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint="https://api.saxoprint.de/product-configuration/get-product-prices",
+            payload_template={},
+            confidence=0.8,
+            notes="",
+        )
+
+        agent = ExecutionAgent()
+        seen_body: dict[str, Any] = {}
+
+        def fake_urlopen(req, timeout=15):
+            nonlocal seen_body
+            raw_body = (getattr(req, "data", None) or b"").decode("utf-8", errors="replace")
+            seen_body = json.loads(raw_body) if raw_body else {}
+            return FakeHttpResponse(
+                json.dumps({"priceGross": 99.99}),
+                content_type="application/json",
+            )
+
+        with mock.patch("price_extractor.agents.request.urlopen", side_effect=fake_urlopen):
+            result, replay_summary = agent._try_http_replay(state)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.price_value, 99.99)
+        self.assertEqual(result.currency, "EUR")
+        self.assertEqual(replay_summary.get("selectedVia"), "json_adapter:saxoprint_brochure_v1")
+
+        summary = dict(result.raw_response_summary or {})
+        self.assertEqual(summary.get("replay"), "adapter")
+
+        adapter_result = dict(summary.get("adapterResult") or {})
+        self.assertEqual(adapter_result.get("price"), 99.99)
+        self.assertEqual(adapter_result.get("currency"), "EUR")
+        self.assertEqual(adapter_result.get("source"), "adapter")
+
+        adapter_diag = dict(summary.get("adapterDiagnostics") or {})
+        self.assertEqual(adapter_diag.get("reason"), "matched")
+        self.assertEqual(adapter_diag.get("matchedAdapterId"), "saxoprint_brochure_v1")
+        self.assertGreaterEqual(int(adapter_diag.get("loadedCount") or 0), 1)
+
+        property_rows = list(seen_body.get("propertyConfiguration") or [])
+        self.assertTrue(property_rows)
+        self.assertEqual(int(property_rows[0].get("value") or 0), 600)
+
+    def test_request_only_validation_accepts_adapter_replay(self) -> None:
+        target = TargetInput(
+            site_name="saxoprint.de",
+            product_url="https://www.saxoprint.de/broschueren/broschueren-drucken",
+            product_type="brochure",
+            expected_currency="EUR",
+            options={"quantity": 600},
+            network_traces=[],
+            bootstrap_signals={
+                "cookies": {},
+                "request_only": True,
+                "learned_normalization_rules": {},
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint="https://api.saxoprint.de/product-configuration/get-product-prices",
+            payload_template={},
+            confidence=0.8,
+            notes="",
+        )
+
+        execution = ExecutionAgent()
+
+        def fake_urlopen(req, timeout=15):
+            return FakeHttpResponse(
+                json.dumps({"priceGross": 99.99}),
+                content_type="application/json",
+            )
+
+        with mock.patch("price_extractor.agents.request.urlopen", side_effect=fake_urlopen):
+            state.extraction = execution.run(state)
+
+        validation = ValidationAgent().run(state)
+        self.assertTrue(validation.is_valid)
+        self.assertFalse(any(str(row).startswith("request_only_replay_mismatch") for row in validation.mismatches))
+        self.assertEqual(str(state.extraction.raw_response_summary.get("replay") or ""), "adapter")
+
+    def test_json_adapter_loader_reports_schema_diagnostics(self) -> None:
+        from price_extractor.json_adapters import load_json_adapters_with_diagnostics
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            adapter_dir = Path(tmp_dir)
+            (adapter_dir / "valid.json").write_text(
+                json.dumps(
+                    {
+                        "id": "valid_adapter",
+                        "match": {"domains": ["example.test"]},
+                        "endpoint": {"url": "https://api.example.test/price", "method": "POST"},
+                        "request_template": {"quantity": 100},
+                        "inject": [{"input_key": "quantity", "path": "quantity", "cast": "int"}],
+                        "response_extract": {"price_path": "priceGross", "currency_const": "EUR"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (adapter_dir / "invalid_schema.json").write_text(
+                json.dumps(
+                    {
+                        "id": "bad_adapter",
+                        "match": {},
+                        "endpoint": {"url": "", "method": "PATCH"},
+                        "request_template": {},
+                        "response_extract": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (adapter_dir / "invalid_json.json").write_text("{ this-is-not-json", encoding="utf-8")
+
+            adapters, diagnostics = load_json_adapters_with_diagnostics(adapter_dir)
+
+        self.assertEqual(len(adapters), 1)
+        self.assertEqual(str(adapters[0].get("id")), "valid_adapter")
+        self.assertEqual(int(diagnostics.get("loadedCount") or 0), 1)
+        self.assertEqual(int(diagnostics.get("invalidCount") or 0), 2)
+        warnings = list(diagnostics.get("warnings") or [])
+        warning_kinds = {str(row.get("kind")) for row in warnings if isinstance(row, dict)}
+        self.assertIn("invalid_json", warning_kinds)
+        self.assertIn("invalid_schema", warning_kinds)
+
+    def test_json_adapter_match_diagnostics_reports_miss_reason(self) -> None:
+        from price_extractor.json_adapters import match_json_adapter_with_diagnostics
+
+        adapters = [
+            {
+                "id": "other_host",
+                "match": {"domains": ["other.example"]},
+                "endpoint": {"url": "https://api.other.example/price", "method": "POST"},
+                "request_template": {},
+                "response_extract": {"price_path": "price"},
+            }
+        ]
+
+        matched, diagnostics = match_json_adapter_with_diagnostics(adapters, "https://example.test/product")
+        self.assertIsNone(matched)
+        self.assertEqual(str(diagnostics.get("reason")), "host_mismatch")
+        self.assertEqual(int(diagnostics.get("loadedCount") or 0), 1)
+
+    def test_json_adapter_loader_skips_disabled_adapter(self) -> None:
+        from price_extractor.json_adapters import load_json_adapters_with_diagnostics
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            adapter_dir = Path(tmp_dir)
+            (adapter_dir / "disabled.json").write_text(
+                json.dumps(
+                    {
+                        "id": "disabled_adapter",
+                        "enabled": False,
+                        "match": {"domains": ["example.test"]},
+                        "endpoint": {"url": "https://api.example.test/price", "method": "POST"},
+                        "request_template": {"quantity": 100},
+                        "response_extract": {"price_path": "priceGross"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            adapters, diagnostics = load_json_adapters_with_diagnostics(adapter_dir)
+
+        self.assertEqual(adapters, [])
+        self.assertEqual(int(diagnostics.get("loadedCount") or 0), 0)
+        self.assertEqual(int(diagnostics.get("skippedCount") or 0), 1)
+        warnings = list(diagnostics.get("warnings") or [])
+        self.assertTrue(any(str(row.get("kind")) == "disabled_adapter" for row in warnings if isinstance(row, dict)))
+
+    def test_json_adapter_loader_skips_env_gated_adapter_without_opt_in(self) -> None:
+        from price_extractor.json_adapters import load_json_adapters_with_diagnostics
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            adapter_dir = Path(tmp_dir)
+            (adapter_dir / "env_gated.json").write_text(
+                json.dumps(
+                    {
+                        "id": "env_gated_adapter",
+                        "enabled": True,
+                        "enabled_when_env": "TEST_ENABLE_JSON_ADAPTER",
+                        "match": {"domains": ["example.test"]},
+                        "endpoint": {"url": "https://api.example.test/price", "method": "POST"},
+                        "request_template": {"quantity": 100},
+                        "response_extract": {"price_path": "priceGross"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict("os.environ", {}, clear=False):
+                adapters, diagnostics = load_json_adapters_with_diagnostics(adapter_dir)
+
+            self.assertEqual(adapters, [])
+            self.assertEqual(int(diagnostics.get("loadedCount") or 0), 0)
+            self.assertEqual(int(diagnostics.get("skippedCount") or 0), 1)
+            warnings = list(diagnostics.get("warnings") or [])
+            self.assertTrue(any(str(row.get("kind")) == "disabled_by_env" for row in warnings if isinstance(row, dict)))
+
+            with mock.patch.dict("os.environ", {"TEST_ENABLE_JSON_ADAPTER": "1"}, clear=False):
+                adapters_enabled, diagnostics_enabled = load_json_adapters_with_diagnostics(adapter_dir)
+
+            self.assertEqual(len(adapters_enabled), 1)
+            self.assertEqual(str(adapters_enabled[0].get("id")), "env_gated_adapter")
+            self.assertEqual(int(diagnostics_enabled.get("loadedCount") or 0), 1)
+
+    def test_json_adapter_executes_print24_when_opted_in(self) -> None:
+        target = TargetInput(
+            site_name="print24.com",
+            product_url="https://print24.com/de/druckprodukte/broschueren/broschueren-klammerheftung-greenline",
+            product_type="brochure",
+            expected_currency="EUR",
+            options={"format": "A5", "quantity": 250},
+            network_traces=[],
+            bootstrap_signals={
+                "cookies": {},
+                "request_only": True,
+                "learned_normalization_rules": {},
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint="https://print24.com/api/de/itemmaster/calculation/productDetails/",
+            payload_template={},
+            confidence=0.8,
+            notes="",
+        )
+
+        agent = ExecutionAgent()
+        seen_body: dict[str, Any] = {}
+
+        def fake_urlopen(req, timeout=15):
+            nonlocal seen_body
+            raw_body = (getattr(req, "data", None) or b"").decode("utf-8", errors="replace")
+            seen_body = json.loads(raw_body) if raw_body else {}
+            return FakeHttpResponse(
+                json.dumps({"prices": {"final_prices": {"total_gross_value": 70.47}}}),
+                content_type="application/json",
+            )
+
+        with mock.patch.dict("os.environ", {"PRICE_ADAPTER_PRINT24_ENABLE": "1"}, clear=False):
+            with mock.patch("price_extractor.agents.request.urlopen", side_effect=fake_urlopen):
+                result, replay_summary = agent._try_http_replay(state)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.price_value, 70.47)
+        self.assertEqual(result.currency, "EUR")
+        self.assertEqual(replay_summary.get("selectedVia"), "json_adapter:print24_brochure_v1")
+
+        summary = dict(result.raw_response_summary or {})
+        self.assertEqual(summary.get("replay"), "adapter")
+
+        adapter_diag = dict(summary.get("adapterDiagnostics") or {})
+        self.assertEqual(adapter_diag.get("reason"), "matched")
+        self.assertEqual(adapter_diag.get("matchedAdapterId"), "print24_brochure_v1")
+
+        self.assertEqual(int(seen_body.get("item_group_id") or 0), 2)
+        self.assertEqual(int(seen_body.get("product_alias_id") or 0), 388)
+        props = {
+            str(row.get("name")): str(row.get("id"))
+            for row in list(seen_body.get("properties") or [])
+            if isinstance(row, dict)
+        }
+        self.assertEqual(props.get("format"), "268")
+        self.assertEqual(props.get("quantity"), "438")
+
+    def test_json_adapter_print24_unsupported_quantity_keeps_template_id(self) -> None:
+        target = TargetInput(
+            site_name="print24.com",
+            product_url="https://print24.com/de/druckprodukte/broschueren/broschueren-klammerheftung-greenline",
+            product_type="brochure",
+            expected_currency="EUR",
+            options={"format": "A5", "quantity": 999},
+            network_traces=[],
+            bootstrap_signals={
+                "cookies": {},
+                "request_only": True,
+                "learned_normalization_rules": {},
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint="https://print24.com/api/de/itemmaster/calculation/productDetails/",
+            payload_template={},
+            confidence=0.8,
+            notes="",
+        )
+
+        agent = ExecutionAgent()
+        seen_body: dict[str, Any] = {}
+
+        def fake_urlopen(req, timeout=15):
+            nonlocal seen_body
+            raw_body = (getattr(req, "data", None) or b"").decode("utf-8", errors="replace")
+            seen_body = json.loads(raw_body) if raw_body else {}
+            return FakeHttpResponse(
+                json.dumps({"prices": {"final_prices": {"total_gross_value": 29.68}}}),
+                content_type="application/json",
+            )
+
+        with mock.patch.dict("os.environ", {"PRICE_ADAPTER_PRINT24_ENABLE": "1"}, clear=False):
+            with mock.patch("price_extractor.agents.request.urlopen", side_effect=fake_urlopen):
+                result, replay_summary = agent._try_http_replay(state)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.price_value, 29.68)
+        self.assertEqual(result.currency, "EUR")
+        self.assertEqual(replay_summary.get("selectedVia"), "json_adapter:print24_brochure_v1")
+
+        props = {
+            str(row.get("name")): str(row.get("id"))
+            for row in list(seen_body.get("properties") or [])
+            if isinstance(row, dict)
+        }
+        self.assertEqual(props.get("format"), "268")
+        self.assertEqual(props.get("quantity"), "339")
+
+        summary = dict(result.raw_response_summary or {})
+        request_applied = dict(summary.get("requestTemplateApplied") or {})
+        injected_rows = list(request_applied.get("injected") or [])
+        injected_keys = {str(row.get("inputKey")) for row in injected_rows if isinstance(row, dict)}
+        self.assertIn("format", injected_keys)
+        self.assertNotIn("quantity", injected_keys)
 
     def test_http_replay_retries_on_429_then_succeeds(self) -> None:
         trace = {
@@ -791,6 +1495,156 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(props.get("quantity"), "438")
         applied = dict(candidate.get("request_template_applied") or {})
         self.assertEqual(applied.get("kind"), "print24_property_ids")
+
+    def test_print24_site_adapter_replay_selects_synthesized_candidate(self) -> None:
+        trace = load_fixture("print24_productdetails_trace.json")
+
+        target = TargetInput(
+            site_name="print24.com",
+            product_url="https://print24.com/de/druckprodukte/broschueren/broschueren-klammerheftung-greenline",
+            product_type="brochure",
+            expected_currency="EUR",
+            options={"format": "A5", "quantity": 250},
+            network_traces=[trace],
+            bootstrap_signals={
+                "cookies": {"portalName": "print24"},
+                "request_only": True,
+                "learned_normalization_rules": {},
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(strategy=Strategy.HYBRID, endpoint=trace["url"], payload_template={}, confidence=0.8, notes="")
+
+        agent = ExecutionAgent()
+        seen_headers: dict[str, str] = {}
+        seen_body: dict[str, Any] = {}
+
+        def fake_urlopen(req, timeout=15):
+            nonlocal seen_headers, seen_body
+            seen_headers = {key.lower(): value for key, value in req.header_items()}
+            raw_body = (getattr(req, "data", None) or b"").decode("utf-8", errors="replace")
+            seen_body = json.loads(raw_body) if raw_body else {}
+            return FakeHttpResponse(
+                json.dumps({"prices": {"final_prices": {"total_gross_value": 70.47}}}),
+                content_type="application/json",
+            )
+
+        with mock.patch.dict("os.environ", {"PRICE_ADAPTER_PRINT24_ENABLE": "0"}, clear=False):
+            with mock.patch("price_extractor.agents.request.urlopen", side_effect=fake_urlopen):
+                result, replay_summary = agent._try_http_replay(state)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.price_value, 70.47)
+        self.assertEqual(result.currency, "EUR")
+        self.assertEqual(seen_headers.get("portal"), "print24")
+        self.assertEqual(replay_summary.get("selectedVia"), "print24_synthesized_template")
+
+        props = {str(row.get("name")): str(row.get("id")) for row in list(seen_body.get("properties") or []) if isinstance(row, dict)}
+        self.assertEqual(props.get("format"), "268")
+        self.assertEqual(props.get("quantity"), "438")
+
+        summary = dict(result.raw_response_summary or {})
+        applied = dict(summary.get("requestTemplateApplied") or {})
+        self.assertEqual(applied.get("kind"), "print24_property_ids")
+        updates = {
+            str(row.get("name")): (str(row.get("from")), str(row.get("to")))
+            for row in list(applied.get("propertiesUpdated") or [])
+            if isinstance(row, dict)
+        }
+        self.assertEqual(updates.get("format"), ("222", "268"))
+        self.assertEqual(updates.get("quantity"), ("339", "438"))
+
+    def test_print24_site_adapter_replay_is_stable_across_multiple_option_sets(self) -> None:
+        trace = load_fixture("print24_productdetails_trace.json")
+        cases = [
+            {
+                "options": {"format": "A5", "quantity": 250},
+                "expected_props": {"format": "268", "quantity": "438"},
+                "expected_updates": {"format": ("222", "268"), "quantity": ("339", "438")},
+            },
+            {
+                "options": {"format": "A6", "quantity": 250},
+                "expected_props": {"format": "222", "quantity": "438"},
+                "expected_updates": {"quantity": ("339", "438")},
+            },
+            {
+                "options": {"format": "A5", "quantity": 10},
+                "expected_props": {"format": "268", "quantity": "339"},
+                "expected_updates": {"format": ("222", "268")},
+            },
+        ]
+
+        agent = ExecutionAgent()
+
+        for case in cases:
+            options = dict(case["options"])
+            target = TargetInput(
+                site_name="print24.com",
+                product_url="https://print24.com/de/druckprodukte/broschueren/broschueren-klammerheftung-greenline",
+                product_type="brochure",
+                expected_currency="EUR",
+                options=options,
+                network_traces=[trace],
+                bootstrap_signals={
+                    "cookies": {"portalName": "print24"},
+                    "request_only": True,
+                    "learned_normalization_rules": {},
+                },
+            )
+            state = RunState(target=target)
+            state.plan = StrategyPlan(strategy=Strategy.HYBRID, endpoint=trace["url"], payload_template={}, confidence=0.8, notes="")
+
+            seen_headers: dict[str, str] = {}
+            seen_body: dict[str, Any] = {}
+
+            def fake_urlopen(req, timeout=15):
+                nonlocal seen_headers, seen_body
+                seen_headers = {key.lower(): value for key, value in req.header_items()}
+                raw_body = (getattr(req, "data", None) or b"").decode("utf-8", errors="replace")
+                seen_body = json.loads(raw_body) if raw_body else {}
+                props = {
+                    str(row.get("name")): str(row.get("id"))
+                    for row in list(seen_body.get("properties") or [])
+                    if isinstance(row, dict)
+                }
+                quantity_id = props.get("quantity")
+                total_gross = 70.47 if quantity_id == "438" else 29.68
+                return FakeHttpResponse(
+                    json.dumps({"prices": {"final_prices": {"total_gross_value": total_gross}}}),
+                    content_type="application/json",
+                )
+
+            with self.subTest(options=options):
+                with mock.patch.dict("os.environ", {"PRICE_ADAPTER_PRINT24_ENABLE": "0"}, clear=False):
+                    with mock.patch("price_extractor.agents.request.urlopen", side_effect=fake_urlopen):
+                        result, replay_summary = agent._try_http_replay(state)
+
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result.currency, "EUR")
+                self.assertEqual(seen_headers.get("portal"), "print24")
+                self.assertEqual(replay_summary.get("selectedVia"), "print24_synthesized_template")
+
+                props = {
+                    str(row.get("name")): str(row.get("id"))
+                    for row in list(seen_body.get("properties") or [])
+                    if isinstance(row, dict)
+                }
+                self.assertEqual(props, dict(case["expected_props"]))
+
+                expected_price = 70.47 if props.get("quantity") == "438" else 29.68
+                self.assertEqual(result.price_value, expected_price)
+
+                summary = dict(result.raw_response_summary or {})
+                applied = dict(summary.get("requestTemplateApplied") or {})
+                self.assertEqual(applied.get("kind"), "print24_property_ids")
+                updates = {
+                    str(row.get("name")): (str(row.get("from")), str(row.get("to")))
+                    for row in list(applied.get("propertiesUpdated") or [])
+                    if isinstance(row, dict)
+                }
+                self.assertEqual(updates, dict(case["expected_updates"]))
 
     def test_wir_machen_druck_template_synthesis_adds_price_scale_id(self) -> None:
         traces = load_fixture("wir_machen_druck_template_traces.json")
@@ -1049,6 +1903,104 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("PAGES=8", str(candidate.get("url") or ""))
         applied = dict(candidate.get("request_template_applied") or {})
         self.assertEqual(applied.get("kind"), "viaprinto_query_params")
+
+    def test_print24_end_to_end_replay_from_captured_fixture(self) -> None:
+        # Regression smoke test for the full bootstrap -> replay -> adapter chain.
+        # Drives ExecutionAgent._try_http_replay with real captured artifacts (network
+        # traces, cookies, JSON adapter) from a successful print24 run so that any
+        # future regression in adapter loading, candidate prioritization, cookie/header
+        # injection, or adapter response extraction will surface here.
+        fixture_dir = FIXTURES / "print24_end_to_end"
+        traces = json.loads((fixture_dir / "network_traces.json").read_text(encoding="utf-8"))
+        cookies = json.loads((fixture_dir / "cookies.json").read_text(encoding="utf-8"))
+        expected = json.loads((fixture_dir / "expected.json").read_text(encoding="utf-8"))
+        json_adapters_dir = fixture_dir / "json_adapters"
+
+        # Sanity-check the fixture is intact so failures here point at the test data,
+        # not the system under test.
+        self.assertGreater(len(traces), 0, "fixture network_traces.json is empty")
+        self.assertIn("portalName", cookies, "fixture cookies missing portalName")
+        self.assertEqual(expected["price"], 70.47)
+        self.assertEqual(expected["replay_mode"], "adapter")
+
+        target = TargetInput(
+            site_name="print24.com",
+            product_url=str(expected["productUrl"]),
+            product_type="brochure",
+            expected_currency="EUR",
+            network_traces=traces,
+            bootstrap_signals={
+                "cookies": cookies,
+                "request_only": False,
+                "learned_normalization_rules": {},
+                "json_adapters_dir": str(json_adapters_dir),
+            },
+        )
+        state = RunState(target=target)
+        state.plan = StrategyPlan(
+            strategy=Strategy.HYBRID,
+            endpoint=str(expected["selectedEndpoint"]),
+            payload_template={},
+            confidence=0.8,
+            notes="",
+        )
+
+        agent = ExecutionAgent()
+        seen_requests: list[dict[str, Any]] = []
+
+        # Replay the print24-shaped response that the JSON adapter parses. The exact
+        # numeric value below is what the live print24 run returned for the captured
+        # configuration; the adapter's response_extract path is
+        # `prices.final_prices.total_gross_value`.
+        def fake_urlopen(req, timeout=15):
+            body = (getattr(req, "data", None) or b"").decode("utf-8", errors="replace")
+            try:
+                parsed_body = json.loads(body) if body else {}
+            except Exception:
+                parsed_body = {"_raw": body[:200]}
+            seen_requests.append(
+                {
+                    "url": req.full_url,
+                    "method": req.get_method(),
+                    "headers": {k.lower(): v for k, v in req.header_items()},
+                    "body": parsed_body,
+                }
+            )
+            return FakeHttpResponse(
+                json.dumps({"prices": {"final_prices": {"total_gross_value": expected["price"]}}}),
+                content_type="application/json",
+            )
+
+        with mock.patch("price_extractor.agents.request.urlopen", side_effect=fake_urlopen):
+            result, replay_summary = agent._try_http_replay(state)
+
+        self.assertIsNotNone(result, "replay should have produced an ExtractionResult")
+        assert result is not None
+        self.assertEqual(result.price_value, expected["price"])
+        self.assertEqual(result.currency, expected["currency"])
+
+        # The JSON adapter must have been the one that fired (not the bare HTTP path).
+        self.assertEqual(replay_summary["decision"], "used")
+        self.assertEqual(replay_summary["selectedEndpoint"], expected["selectedEndpoint"])
+        self.assertEqual(replay_summary["selectedVia"], expected["selectedVia"])
+
+        adapter_result = dict((result.raw_response_summary or {}).get("adapterResult") or {})
+        self.assertEqual(adapter_result.get("price"), expected["price"])
+        self.assertEqual(adapter_result.get("source"), "adapter")
+        self.assertEqual((result.raw_response_summary or {}).get("replay"), "adapter")
+
+        # Confirm the outgoing request actually hit the adapter's endpoint with the
+        # portal header (from cookies) and a JSON body shaped like the adapter template.
+        self.assertEqual(len(seen_requests), 1)
+        sent = seen_requests[0]
+        self.assertEqual(sent["url"], expected["selectedEndpoint"])
+        self.assertEqual(sent["method"], "POST")
+        self.assertEqual(sent["headers"].get("portal"), "print24")
+        self.assertIsInstance(sent["body"], dict)
+        self.assertIn("properties", sent["body"])
+        # The adapter template ships product_alias_id; this guards against accidental
+        # body re-templating that would strip required keys.
+        self.assertEqual(sent["body"].get("product_alias_id"), 388)
 
     def test_persists_replay_template_on_deterministic_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .agents import state_snapshot
-from .agentic.onboarding import build_onboarding_proposal
+from .agentic.onboarding import _canonical_option_key, build_onboarding_proposal
 from .agentic.langgraph_onboarding import build_langgraph_onboarding_payload
 from .bootstrap_schema import (
     BootstrapArtifacts,
@@ -32,6 +32,19 @@ from .job_state import (
 )
 from .knowledge_store import KnowledgeStore
 from .models import RunState, TargetInput
+from .form_field_inference import (
+    build_form_field_map_from_traces,
+    enrich_catalog_with_form_fields,
+    quantity_tile_signals,
+)
+from .option_catalog_postprocess import regroup_singleton_clusters
+from .print24_catalog import harvest_print24_catalog_from_traces
+from .value_map_loader import (
+    describe_value_map,
+    load_value_map,
+    resolve_value as resolve_value_map_value,
+)
+from .agentic.adapter_generation import generate_runnable_adapters
 from .orchestrator import ExtractionOrchestrator, summarize_run
 from .staged_runner import run_staged_rollout
 
@@ -300,37 +313,43 @@ def _compact_prevalidation(prevalidation: dict[str, Any]) -> dict[str, Any]:
 
 def _catalog_groups_from_bootstrap(bootstrap_artifacts: dict[str, Any]) -> list[dict[str, Any]]:
     catalog = list(bootstrap_artifacts.get("option_catalog") or [])
+    network_traces = list(bootstrap_artifacts.get("network_traces") or [])
     if catalog:
-        return catalog
+        regrouped = catalog
+    else:
+        summary_groups = list(bootstrap_artifacts.get("option_groups") or [])
+        regrouped = regroup_singleton_clusters(summary_groups) if summary_groups else []
 
-    fallback_groups: list[dict[str, Any]] = []
-    for row in list(bootstrap_artifacts.get("option_groups") or []):
-        group_label = str(row.get("group") or "").strip() or "unknown"
-        sample_values = [str(value).strip() for value in list(row.get("sampleValues") or []) if str(value).strip()]
-        fallback_groups.append(
-            {
-                "groupLabel": group_label,
-                "normalizedGroupLabel": _normalize_match_text(group_label),
-                "visibleGroupLabel": group_label,
-                "controlTypes": list(row.get("controlTypes") or []),
-                "options": [
-                    {
-                        "visibleLabel": value,
-                        "visibleValue": value,
-                        "selected": False,
-                        "controlTag": "unknown",
-                        "controlType": "unknown",
-                        "name": "",
-                        "backendHints": {},
-                    }
-                    for value in sample_values
-                ],
-                "truncated": False,
-                "backendHints": {},
-                "sourceHints": {},
-            }
-        )
-    return fallback_groups
+    # Print24's DOM walker doesn't see the Next.js-rendered option widgets,
+    # so its `option_groups` is either empty or full of irrelevant display
+    # preferences (Nettopreise / Bruttopreise / etc.). The productDetails AJAX
+    # response carries the currently-selected option per group with the right
+    # `prop_id`, so harvest it regardless and prepend — pre-validation prefers
+    # rows with structured backendHints over labelled-only fallback rows.
+    print24_rows = harvest_print24_catalog_from_traces(network_traces)
+    if print24_rows:
+        regrouped = print24_rows + regrouped
+
+    if not regrouped:
+        return []
+
+    # Enrich with form-field metadata learned from:
+    #   (a) the captured baseline POST (currently-selected option codes), and
+    #   (b) `<input ... name="input_var_..." ... data-varindex="...">` elements
+    #       embedded in configurator AJAX response HTML (full option-code map
+    #       for non-current variants, per the variant-URL scrape approach).
+    # Sites without input_var-style fields (Print24, Saxoprint) get a no-op.
+    network_traces = list(bootstrap_artifacts.get("network_traces") or [])
+    product_url = ""
+    for trace in network_traces:
+        if isinstance(trace, dict) and str(trace.get("method") or "").upper() == "POST":
+            product_url = str(trace.get("url") or "")
+            if product_url:
+                break
+    form_map = build_form_field_map_from_traces(network_traces, product_url)
+    if not form_map.fields and not form_map.variants:
+        return regrouped
+    return enrich_catalog_with_form_fields(regrouped, form_map)
 
 
 def _catalog_option_score(option_row: dict[str, Any], requested_value: Any) -> int:
@@ -406,7 +425,12 @@ def _group_match_score(group_row: dict[str, Any], key_aliases: set[str], request
     return score
 
 
-def _prevalidate_requested_options(options: dict[str, Any], bootstrap_artifacts: dict[str, Any]) -> dict[str, Any]:
+def _prevalidate_requested_options(
+    options: dict[str, Any],
+    bootstrap_artifacts: dict[str, Any],
+    *,
+    allow_sideload_ui_only: bool = False,
+) -> dict[str, Any]:
     catalog_groups = _catalog_groups_from_bootstrap(bootstrap_artifacts)
     quantity_signal = dict(bootstrap_artifacts.get("quantity_signal") or {})
     available = bool(catalog_groups) or bool(quantity_signal.get("hasManualInput")) or bool(quantity_signal.get("presetValues"))
@@ -420,10 +444,22 @@ def _prevalidate_requested_options(options: dict[str, Any], bootstrap_artifacts:
     }
 
     if not options:
+        _augment_with_sideload(
+            result,
+            options,
+            bootstrap_artifacts,
+            allow_ui_only=allow_sideload_ui_only,
+        )
         return result
 
     if not available:
         result["warnings"].append("option_catalog_unavailable")
+        _augment_with_sideload(
+            result,
+            options,
+            bootstrap_artifacts,
+            allow_ui_only=allow_sideload_ui_only,
+        )
         return result
 
     for key, requested_value in options.items():
@@ -434,17 +470,65 @@ def _prevalidate_requested_options(options: dict[str, Any], bootstrap_artifacts:
 
         if canonical_quantity:
             matched_quantity_control: dict[str, Any] | None = None
+            numeric_value_re = re.compile(r"^\d+(?:[.,]\d+)?$")
             for group_row in catalog_groups:
                 if _group_match_score(group_row, key_aliases, requested_value) <= 0:
                     continue
+                # Require the option's current value to look numeric. Non-numeric
+                # options (e.g. paper labels like "115 g/m² Bilderdruckpapier" that
+                # now carry an enriched `name` attribute) must not be picked as
+                # the quantity control; otherwise the synthesis adapter would
+                # write the quantity number into the paper input_var field.
                 numeric_options = [
                     option_row
                     for option_row in list(group_row.get("options") or [])
                     if str(option_row.get("name") or "").strip()
+                    and numeric_value_re.match(str(option_row.get("visibleValue") or "").strip())
                 ]
                 if numeric_options:
                     matched_quantity_control = numeric_options[0]
                     break
+
+            # Backstop: if the requested quantity isn't represented in any
+            # catalog group (e.g. user types an off-preset value like 12345
+            # while the configurator's presets jump 11000/12000/13000), pick
+            # any catalog option whose name starts with `input_var_` and whose
+            # visibleValue is numeric. All options of one quantity tile field
+            # share the same form-field name, so the choice is structurally
+            # equivalent — we just need a handle on the qty field so the
+            # synthesis adapter can switch to interpolation mode.
+            #
+            # Print24-style fallback: a catalog row whose option's `name` is the
+            # literal canonical key `"quantity"` (the box_name from
+            # productDetails harvesting) IS the quantity control regardless of
+            # the visible label format (Print24 renders "10 Stück" / "quantity 10",
+            # not a bare number).
+            if matched_quantity_control is None:
+                for group_row in catalog_groups:
+                    for option_row in list(group_row.get("options") or []):
+                        name = str(option_row.get("name") or "").strip()
+                        value = str(option_row.get("visibleValue") or "").strip()
+                        if name == "quantity":
+                            matched_quantity_control = option_row
+                            break
+                        if name.startswith("input_var_") and numeric_value_re.match(value):
+                            matched_quantity_control = option_row
+                            break
+                    if matched_quantity_control is not None:
+                        break
+
+            quantity_field_name = str((matched_quantity_control or {}).get("name") or "")
+            tile_signals = (
+                quantity_tile_signals(catalog_groups, quantity_field_name)
+                if quantity_field_name
+                else {
+                    "tilePresets": [],
+                    "tileVarindexByValue": {},
+                    "interpolationVarindex": "",
+                    "supportsInterpolation": False,
+                    "maxTilePreset": 0,
+                }
+            )
 
             if quantity_signal.get("hasManualInput", False):
                 result["matched"].append(
@@ -455,6 +539,7 @@ def _prevalidate_requested_options(options: dict[str, Any], bootstrap_artifacts:
                         "matchedLabel": str(requested_value),
                         "matchType": "quantity_manual",
                         "catalogOption": matched_quantity_control,
+                        "quantityTileSignals": tile_signals,
                     }
                 )
                 continue
@@ -469,6 +554,33 @@ def _prevalidate_requested_options(options: dict[str, Any], bootstrap_artifacts:
                         "matchedLabel": str(requested_value),
                         "matchType": "quantity_preset",
                         "catalogOption": matched_quantity_control,
+                        "quantityTileSignals": tile_signals,
+                    }
+                )
+                continue
+
+            # Catalog-only quantity match (Print24-style): the DOM walker
+            # gave us no `quantity_signal` (Print24 renders inside Next.js
+            # client components the walker can't see), but the productDetails
+            # harvest produced a catalog row whose option carries the
+            # currently-captured prop_id under `backendHints.dataPropertyId`.
+            # Honor the match so the synthesis adapter can use the prop_id;
+            # the catalog only knows the currently-captured value, so any
+            # OTHER quantity will still need a prop_id mapping the user
+            # supplies explicitly (or a future `repo` probe).
+            if matched_quantity_control and (
+                str(matched_quantity_control.get("name") or "") == "quantity"
+                or str((matched_quantity_control.get("backendHints") or {}).get("dataPropertyId") or "")
+            ):
+                result["matched"].append(
+                    {
+                        "key": key,
+                        "requestedValue": requested_value,
+                        "groupLabel": "quantity",
+                        "matchedLabel": str(matched_quantity_control.get("visibleLabel") or requested_value),
+                        "matchType": "catalog_only",
+                        "catalogOption": matched_quantity_control,
+                        "quantityTileSignals": tile_signals,
                     }
                 )
                 continue
@@ -555,7 +667,134 @@ def _prevalidate_requested_options(options: dict[str, Any], bootstrap_artifacts:
             }
         )
 
+    _augment_with_sideload(
+        result,
+        options,
+        bootstrap_artifacts,
+        allow_ui_only=allow_sideload_ui_only,
+    )
     return result
+
+
+def _augment_with_sideload(
+    prevalidation: dict[str, Any],
+    options: dict[str, Any],
+    bootstrap_artifacts: dict[str, Any],
+    *,
+    allow_ui_only: bool,
+) -> None:
+    """Resolve each requested option against the sideloaded value-map and
+    attach `sideloadResolution` to existing matched rows or promote previously
+    unmatched rows. Records the loaded-map summary on `prevalidation` under
+    `sideload` so the CLI can emit the [sideload-loaded] diagnostic without
+    re-reading the file.
+    """
+    site_name = str(bootstrap_artifacts.get("site_name") or "").strip().lower()
+    value_map = load_value_map(site_name) if site_name else None
+    prevalidation["sideload"] = {
+        "site": site_name,
+        "summary": describe_value_map(value_map),
+        "allowUiOnly": bool(allow_ui_only),
+        "outcomes": [],
+    }
+    if not options or not value_map or value_map.get("_loadError"):
+        return
+
+    matched_by_key: dict[str, dict[str, Any]] = {
+        str(row.get("key") or ""): row
+        for row in prevalidation.get("matched", [])
+        if isinstance(row, dict)
+    }
+    unmatched_index_by_key: dict[str, int] = {}
+    for idx, row in enumerate(prevalidation.get("unmatched", [])):
+        if isinstance(row, dict):
+            unmatched_index_by_key[str(row.get("key") or "")] = idx
+
+    for key, requested_value in options.items():
+        canonical = _canonical_option_key(key)
+        if not canonical:
+            prevalidation["sideload"]["outcomes"].append(
+                {"key": key, "canonicalKey": None, "status": "no_canonical_key"}
+            )
+            continue
+        outcome = resolve_value_map_value(
+            value_map,
+            canonical,
+            requested_value,
+            allow_ui_only=allow_ui_only,
+        )
+        outcome_record = {
+            "key": key,
+            "canonicalKey": canonical,
+            "status": outcome.get("status"),
+            "propertyId": outcome.get("propertyId"),
+            "backendId": outcome.get("backendId"),
+            "matchedLabel": outcome.get("matchedLabel"),
+            "confidence": outcome.get("confidence"),
+            "productScope": outcome.get("productScope"),
+            "sourceLabel": outcome.get("sourceLabel"),
+            "propertyNote": outcome.get("propertyNote"),
+            "candidates": outcome.get("candidates"),
+            "candidateLabels": outcome.get("candidateLabels"),
+        }
+        prevalidation["sideload"]["outcomes"].append(outcome_record)
+
+        if outcome.get("status") != "resolved":
+            continue
+
+        resolution = {
+            "propertyId": outcome["propertyId"],
+            "backendId": outcome["backendId"],
+            "matchedLabel": outcome["matchedLabel"],
+            "confidence": outcome["confidence"],
+            "sourceLabel": outcome.get("sourceLabel"),
+            "productScope": outcome.get("productScope"),
+            "source": "sideload",
+            "propertyNote": outcome.get("propertyNote"),
+        }
+
+        if key in matched_by_key:
+            matched_by_key[key]["sideloadResolution"] = resolution
+            continue
+
+        promoted_row: dict[str, Any] = {
+            "key": key,
+            "requestedValue": requested_value,
+            "groupLabel": outcome.get("sourceLabel") or canonical,
+            "matchedLabel": outcome["matchedLabel"],
+            "matchType": "sideload_only",
+            "catalogOption": {
+                "name": str(outcome["propertyId"]),
+                "visibleLabel": outcome["matchedLabel"],
+                "visibleValue": outcome["matchedLabel"],
+                "backendHints": {
+                    "dataPropertyId": outcome["propertyId"],
+                    "backendId": outcome["backendId"],
+                    "source": "sideload",
+                },
+            },
+            "sideloadResolution": resolution,
+        }
+        prevalidation["matched"].append(promoted_row)
+        matched_by_key[key] = promoted_row
+
+        if key in unmatched_index_by_key:
+            idx = unmatched_index_by_key[key]
+            try:
+                prevalidation["unmatched"].pop(idx)
+            except IndexError:
+                pass
+            unmatched_index_by_key = {
+                str(row.get("key") or ""): i
+                for i, row in enumerate(prevalidation.get("unmatched", []))
+                if isinstance(row, dict)
+            }
+            err_marker = f"key={key} requested={requested_value}"
+            prevalidation["errors"] = [
+                msg for msg in prevalidation.get("errors", []) if err_marker not in str(msg)
+            ]
+            if not prevalidation["unmatched"] and not prevalidation["errors"]:
+                prevalidation["valid"] = True
 
 
 def _recon_signature(bootstrap_artifacts: dict[str, Any]) -> dict[str, Any]:
@@ -942,6 +1181,9 @@ def _target_from_bootstrap_artifacts(
             "allow_heuristic_fallback": bool(args.allow_heuristic_fallback),
             "require_matched_options": bool(args.require_matched_options),
             "request_only": bool(getattr(args, "request_only", False)),
+            "json_adapters_dir": str(getattr(args, "json_adapters_dir", "") or "").strip(),
+            "site_adapters_dir": str(getattr(args, "site_adapters_dir", "") or "").strip(),
+            "allow_generated_site_adapters": bool(getattr(args, "allow_generated_site_adapters", False)),
             "http_runtime": {
                 "timeout_seconds": max(float(getattr(args, "http_request_timeout_seconds", 15.0) or 15.0), 1.0),
                 "min_delay_ms": max(int(getattr(args, "http_min_delay_ms", 0) or 0), 0),
@@ -1046,7 +1288,33 @@ def build_target_input(
             "fromCachedRecon": True,
         }
 
-    bootstrap_artifacts["option_prevalidation"] = _prevalidate_requested_options(options, bootstrap_artifacts)
+    bootstrap_artifacts["option_prevalidation"] = _prevalidate_requested_options(
+        options,
+        bootstrap_artifacts,
+        allow_sideload_ui_only=bool(getattr(args, "allow_sideload_ui_only", False)),
+    )
+    sideload_info = dict(
+        (bootstrap_artifacts.get("option_prevalidation") or {}).get("sideload") or {}
+    )
+    sideload_summary = dict(sideload_info.get("summary") or {})
+    if args.verbose and sideload_summary.get("loaded"):
+        print(
+            "[sideload-loaded] "
+            + json.dumps(
+                {
+                    "site": sideload_summary.get("site"),
+                    "path": sideload_summary.get("path"),
+                    "schemaVersion": sideload_summary.get("schemaVersion"),
+                    "captureMethod": sideload_summary.get("captureMethod"),
+                    "generatedAt": sideload_summary.get("generatedAt"),
+                    "propertyCount": sideload_summary.get("propertyCount"),
+                    "canonicalKeys": sideload_summary.get("canonicalKeys"),
+                    "allowUiOnly": sideload_info.get("allowUiOnly", False),
+                    "loadError": sideload_summary.get("loadError"),
+                },
+                ensure_ascii=False,
+            )
+        )
     bootstrap_artifacts["recon_refresh_reason"] = recon_refresh_reason
     bootstrap_artifacts.setdefault("drift_report", {})
     target = _target_from_bootstrap_artifacts(spec, args, url, options, bootstrap_artifacts)
@@ -1126,9 +1394,44 @@ def _print_verbose_bootstrap(url: str, bootstrap_artifacts: dict[str, Any]) -> N
             f"attempted={consent_state.get('attempted', False)} "
             f"banner_detected={consent_state.get('bannerDetected', False)} "
             f"clicked={consent_state.get('clicked', False)} "
+            f"deferred={consent_state.get('deferred', False)} "
             f"selector={consent_state.get('matchedSelector')} "
             f"text={consent_state.get('matchedText')}"
         )
+        retry_attempts = list(consent_state.get("retryAttempts") or [])
+        if retry_attempts:
+            print(
+                f"[bootstrap-consent-retry] count={len(retry_attempts)} "
+                f"any_clicked={any(a.get('clicked') for a in retry_attempts)} "
+                f"any_banner={any(a.get('bannerDetected') for a in retry_attempts)}"
+            )
+        readiness_info = consent_state.get("readiness") or {}
+        if readiness_info:
+            print(
+                "[bootstrap-readiness] "
+                f"reason={readiness_info.get('reason')} "
+                f"waited_ms={readiness_info.get('waitedMs')} "
+                f"max_wait_ms={readiness_info.get('maxWaitMs')} "
+                f"interactive_count={readiness_info.get('interactiveCount')} "
+                f"api_hits={readiness_info.get('apiHits')} "
+                f"consent_retries={readiness_info.get('consentRetriesAttempted', 0)}"
+            )
+        label_probe = consent_state.get("labelProbe") or {}
+        if label_probe:
+            print(
+                "[bootstrap-label-probe] "
+                f"groups_detected={len(label_probe.get('groupsDetected') or [])} "
+                f"clicks_performed={len(label_probe.get('clicksPerformed') or [])} "
+                f"request_delta={label_probe.get('requestCountDelta', 0)} "
+                f"pricing_api_delta={label_probe.get('pricingApiHitsDelta', 0)} "
+                f"error={label_probe.get('error')}"
+            )
+            groups = list(label_probe.get("groupsDetected") or [])
+            if groups:
+                print(f"[bootstrap-label-probe-groups] {json.dumps(groups[:8], ensure_ascii=True)}")
+            clicks = list(label_probe.get("clicksPerformed") or [])
+            if clicks:
+                print(f"[bootstrap-label-probe-clicks] {json.dumps(clicks[:8], ensure_ascii=True)}")
 
     if option_application:
         matched = list(option_application.get("matched") or [])
@@ -1303,6 +1606,13 @@ def _print_verbose_outcome(summary: dict[str, Any], final_state: RunState) -> No
             f"reason={summary.get('extraction_reason')} "
             f"price_source={response_summary.get('priceSource')} price_score={response_summary.get('priceScore')}"
         )
+        adapter_diag = dict(response_summary.get("adapterDiagnostics") or {})
+        if adapter_diag:
+            print(
+                "[adapter] "
+                f"loaded={adapter_diag.get('loadedCount')} matched={adapter_diag.get('matchedAdapterId')} "
+                f"reason={adapter_diag.get('reason')} warnings={len(list(adapter_diag.get('warnings') or []))}"
+            )
         named_prices = dict(response_summary.get("namedPrices") or {})
         if named_prices:
             print(f"[execution-named-prices] {json.dumps(named_prices, ensure_ascii=True)}")
@@ -1345,6 +1655,40 @@ def _print_verbose_outcome(summary: dict[str, Any], final_state: RunState) -> No
         request_template_applied = dict(response_summary.get("requestTemplateApplied") or {})
         if request_template_applied:
             print(f"[execution-request-template] {json.dumps(request_template_applied, ensure_ascii=True)}")
+            skipped_injections = list(request_template_applied.get("skipped") or [])
+            if skipped_injections:
+                print(
+                    "[adapter-injection-skipped] "
+                    + json.dumps(
+                        {"count": len(skipped_injections), "entries": skipped_injections},
+                        ensure_ascii=True,
+                    )
+                )
+            unsupported_inputs = list(request_template_applied.get("unsupportedInputs") or [])
+            if unsupported_inputs:
+                print(
+                    "[adapter-injection-unsupported] "
+                    + json.dumps(
+                        {
+                            "count": len(unsupported_inputs),
+                            "entries": unsupported_inputs,
+                            "note": "These --option keys were supplied but no inject/synthesis rule covered them; the request was sent with the template default for those fields.",
+                        },
+                        ensure_ascii=True,
+                    )
+                )
+            sideload_applied_entries = list(request_template_applied.get("sideloadApplied") or [])
+            if sideload_applied_entries:
+                print(
+                    "[adapter-injection-applied-sideload] "
+                    + json.dumps(
+                        {
+                            "count": len(sideload_applied_entries),
+                            "entries": sideload_applied_entries,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
         request_payload = dict(response_summary.get("requestPayload") or {})
         if request_payload:
             print(f"[execution-request-payload] {json.dumps(request_payload, ensure_ascii=True)}")
@@ -1463,12 +1807,19 @@ def run_single_target(
         recon_cache = dict(initial_summary.get("recon_cache") or {})
         if recon_cache.get("hit"):
             request_only = bool(initial_summary.get("request_only", False)) or bool(getattr(args, "request_only", False))
-            has_request_templates = bool(dict(initial_bootstrap.get("request_templates") or {}))
-            has_option_catalog = bool(list(initial_bootstrap.get("option_catalog") or []))
+            # Distinguish "key absent" (snapshot pre-dates the feature → refresh
+            # once to populate) from "key present but empty" (current bootstrap
+            # ran and the site genuinely has none — refreshing won't change
+            # anything and only causes per-run re-bootstrap churn).
+            templates_key_absent = "request_templates" not in initial_bootstrap
+            catalog_key_absent = "option_catalog" not in initial_bootstrap
 
             # Cache-hit refresh is meant to enrich the recon snapshot (option catalog + request templates).
             # In request-only mode, an empty option catalog is expected and should not force a refresh.
-            if not has_request_templates or ((not request_only) and (not has_option_catalog)):
+            # Symmetrically: an empty request_templates dict is expected on sites without SetLink-style
+            # templates (Saxoprint, Print24) and must not force a refresh either; only an *absent* key
+            # (legacy snapshot from before the feature existed) triggers re-bootstrap.
+            if templates_key_absent or ((not request_only) and catalog_key_absent):
                 refresh_reason = "missing_enriched_recon"
             else:
                 refresh_reason = _should_refresh_cached_recon(initial_summary)
@@ -1618,6 +1969,14 @@ def parse_args() -> argparse.Namespace:
         help="Fail validation when any requested options remain unmatched after bootstrap option application",
     )
     parser.add_argument(
+        "--allow-sideload-ui-only",
+        action="store_true",
+        help=(
+            "Allow sideload value-map entries with confidence='ui_only' to participate in resolution. "
+            "Default is to only accept 'confirmed' and 'partial' entries."
+        ),
+    )
+    parser.add_argument(
         "--request-only",
         action="store_true",
         help=(
@@ -1711,6 +2070,19 @@ def parse_args() -> argparse.Namespace:
         help="Cooldown window before a quarantined proxy can be retried",
     )
     parser.add_argument(
+        "--json-adapters-dir",
+        help="Optional directory of JSON adapters to load instead of the default adapters/ search",
+    )
+    parser.add_argument(
+        "--site-adapters-dir",
+        help="Optional directory of generated SiteAdapter Python modules to load",
+    )
+    parser.add_argument(
+        "--allow-generated-site-adapters",
+        action="store_true",
+        help="Allow loading generated SiteAdapter modules from --site-adapters-dir",
+    )
+    parser.add_argument(
         "--max-dependency-probe-steps",
         type=int,
         default=6,
@@ -1794,6 +2166,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Number of top ranked endpoints to include in each staged onboarding proposal",
+    )
+    parser.add_argument(
+        "--staged-generate-runnable-adapters",
+        action="store_true",
+        help="Emit runnable JSON adapters + optional SiteAdapter modules alongside staged proposals",
+    )
+    parser.add_argument(
+        "--staged-generated-adapters-dir",
+        help="Optional base directory to write generated adapters (defaults to per-unit proposal folder)",
     )
     parser.add_argument(
         "--staged-agentic-use-langgraph",
@@ -1989,6 +2370,18 @@ def main() -> None:
                                 "adapter_stub": adapter_stub_path,
                                 "patch_plan": patch_plan_file_path,
                             }
+
+                            if bool(getattr(stage_args, "staged_generate_runnable_adapters", False)):
+                                base_generated_dir = str(getattr(stage_args, "staged_generated_adapters_dir", "") or "").strip()
+                                generated_root = Path(base_generated_dir) if base_generated_dir else target_dir
+                                generated_dir = generated_root / "generated" / unit_slug
+                                generated = generate_runnable_adapters(
+                                    run_dir=str(artifact_dir),
+                                    output_dir=str(generated_dir),
+                                    proposal=proposal_body,
+                                    llm_suggestions=dict(payload.get("llmSuggestions") or {}),
+                                )
+                                summary["agentic_proposal"]["generated_adapters"] = generated
                         else:
                             proposal = build_onboarding_proposal(
                                 run_dir=str(artifact_dir),
@@ -2014,6 +2407,18 @@ def main() -> None:
                                 "proposal_json": str(proposal_json_path),
                                 "adapter_stub": str(adapter_stub_path),
                             }
+
+                            if bool(getattr(stage_args, "staged_generate_runnable_adapters", False)):
+                                base_generated_dir = str(getattr(stage_args, "staged_generated_adapters_dir", "") or "").strip()
+                                generated_root = Path(base_generated_dir) if base_generated_dir else target_dir
+                                generated_dir = generated_root / "generated" / unit_slug
+                                generated = generate_runnable_adapters(
+                                    run_dir=str(artifact_dir),
+                                    output_dir=str(generated_dir),
+                                    proposal=asdict(proposal),
+                                    llm_suggestions=None,
+                                )
+                                summary["agentic_proposal"]["generated_adapters"] = generated
                     return summary
                 finally:
                     local_store.close()
